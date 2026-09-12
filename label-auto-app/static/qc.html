@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>质检平台</title>
+<link rel="stylesheet" href="/static/qc.css">
+</head>
+<body>
+
+<!-- 登录视图（未登录时显示） -->
+<div id="loginView" class="login-view hidden">
+  <div class="login-box">
+    <h2>质检平台</h2>
+    <input id="loginEmail" placeholder="邮箱（v_xxx@baidu.com）">
+    <input id="loginPassword" type="password" placeholder="密码">
+    <button id="loginBtn" class="btn primary">登录</button>
+    <div class="hint" id="loginError"></div>
+  </div>
+</div>
+
+<header class="qc-topbar hidden" id="appHeader">
+  <div class="qc-title">质检平台</div>
+  <label class="qc-field">项目
+    <select id="qcProject"></select>
+  </label>
+  <div class="qc-tabs">
+    <button class="tab active" data-tab="pending">未质检<span class="tab-badge" id="badgePending"></span></button>
+    <button class="tab" data-tab="passed">已通过<span class="tab-badge" id="badgePassed"></span></button>
+    <button class="tab" data-tab="rejected">已打回<span class="tab-badge" id="badgeRejected"></span></button>
+    <button class="tab" data-tab="recent">最近提交</button>
+  </div>
+  <div class="qc-counts" id="qcCounts"></div>
+  <div class="qc-daily-stats" id="qcDailyStats"></div>
+  <div class="qc-spacer"></div>
+  <div class="qc-user" id="qcUser"></div>
+  <button id="qcSubmit" class="btn primary" disabled>提交</button>
+  <button id="qcSettings" class="btn">设置</button>
+  <button id="qcLogout" class="btn">退出登录</button>
+</header>
+
+<main class="qc-workspace hidden" id="appMain">
+  <section id="pendingPanel" class="panel">
+    <div id="qcGrid" class="qc-grid qc-grid-4"></div>
+  </section>
+  <section id="browsePanel" class="panel hidden">
+    <div id="browseGrid" class="qc-grid qc-grid-browse"></div>
+    <div class="qc-actions">
+      <button id="qcMore" class="btn">加载更多</button>
+    </div>
+  </section>
+  <section id="recentPanel" class="panel hidden">
+    <div id="recentGrid" class="qc-grid qc-grid-browse"></div>
+  </section>
+</main>
+
+<!-- 大图查看（编辑 + 关闭） -->
+<div id="lightbox" class="lightbox hidden">
+  <div id="lightboxSidebar" class="lightbox-sidebar hidden">
+    <div class="lb-cats" id="lbCats"></div>
+    <div class="lb-hint">左键拖动画框 · 右键拖动平移 · 单击选中 · 双击删除 · C保存</div>
+  </div>
+  <div id="lightboxViewer" class="viewer full"></div>
+  <div id="lightboxFloat" class="lightbox-float hidden">
+    <button id="editSave" class="btn lb-btn lb-primary">保存 (C)</button>
+    <button id="lightboxClose" class="btn lb-btn">关闭</button>
+  </div>
+</div>
+
+<!-- 快捷键设置 -->
+<div id="settings" class="settings hidden">
+  <div class="settings-box">
+    <div class="settings-head">
+      <span>快捷键设置</span>
+      <button id="settingsClose" class="settings-close">×</button>
+    </div>
+    <div class="settings-body">
+      <label>图1（左上）切换键 <input id="key1" class="key-input" readonly></label>
+      <label>图2（右上）切换键 <input id="key2" class="key-input" readonly></label>
+      <label>图3（左下）切换键 <input id="key3" class="key-input" readonly></label>
+      <label>图4（右下）切换键 <input id="key4" class="key-input" readonly></label>
+      <label>提交键 <input id="keySubmit" class="key-input" readonly></label>
+    </div>
+    <div class="settings-foot">
+      <button id="settingsReset" class="btn">恢复默认</button>
+      <button id="settingsSave" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+<script src="/static/viewer.js"></script>
+<script src="/static/qc.js"></script>
+</body>
+</html>

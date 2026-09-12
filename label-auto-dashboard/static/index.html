@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Label Auto 看板</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Label Auto <span>外接看板</span></div>
+    <div class="topbar-links">
+      <a class="btn link-btn" href="/anno">作业平台</a>
+      <a class="btn link-btn" href="/qc">质检平台</a>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="query" class="active">标签巡检</button>
+    <button data-tab="leak">漏标告警</button>
+    <button data-tab="monitor">质检看板</button>
+    <button data-tab="dist">标签分布</button>
+    <button data-tab="search">图片搜索</button>
+    <button data-tab="export">导出</button>
+    <button data-tab="fix">归属修复</button>
+  </nav>
+
+  <div class="project-bar hidden" id="projectBar">
+    <label>项目：</label>
+    <select id="projectSel"></select>
+    <button id="refreshBtn" class="btn">刷新</button>
+  </div>
+
+  <main class="workspace">
+    <div class="content-col">
+    <!-- 标签巡检 -->
+    <section id="tab-query" class="tab-panel">
+      <div class="toolbar">
+        <label>标签：</label>
+        <div class="label-picker" id="labelPicker">
+          <div class="label-picker-field" id="labelPickerField">
+            <span class="placeholder">选择标签（可多选，留空查全部）</span>
+          </div>
+          <div class="label-picker-dropdown hidden" id="labelPickerDropdown"></div>
+        </div>
+        <label>状态：</label>
+        <select id="queryStatus">
+          <option value="">全部</option>
+          <option value="passed">已通过</option>
+          <option value="pending">待质检</option>
+          <option value="rejected">已打回</option>
+        </select>
+        <label>质检员：</label>
+        <select id="queryOwner"><option value="">全部</option></select>
+        <label>排序：</label>
+        <select id="querySort">
+          <option value="">默认</option>
+          <option value="reviewed_desc">质检通过时间（新→旧）</option>
+        </select>
+        <label>通过时间：</label>
+        <select id="queryPassedMinutes">
+          <option value="">全部</option>
+          <option value="10">最近10分钟</option>
+          <option value="30">最近30分钟</option>
+          <option value="60">最近1小时</option>
+          <option value="360">最近6小时</option>
+        </select>
+        <button id="queryBtn" class="btn primary">查询</button>
+        <button id="batchRejectBtn" class="btn danger">批量打回</button>
+        <button id="batchPassBtn" class="btn success">批量通过</button>
+        <button id="queryExportBtn" class="btn">导出 CSV</button>
+      </div>
+      <div class="summary" id="querySummary"></div>
+      <div class="table-wrap">
+        <table id="queryTable" class="hidden">
+          <thead>
+            <tr><th class="ck"><input type="checkbox" id="querySelectAll" title="全选"></th><th>图片</th><th>框坐标 (x,y,w,h)</th><th>状态</th><th>质检员</th><th>质检时间</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 漏标告警 -->
+    <section id="tab-leak" class="tab-panel hidden">
+      <div class="toolbar">
+        <label>异常标签（逗号分隔）：</label>
+        <input id="leakCats" value="前挡玻璃遮挡" placeholder="前挡玻璃遮挡,车辆遮挡">
+        <button id="leakBtn" class="btn primary">扫描漏标</button>
+      </div>
+      <div class="summary" id="leakSummary"></div>
+      <div class="table-wrap">
+        <table id="leakTable" class="hidden">
+          <thead>
+            <tr><th>图片</th><th>框坐标 (x,y,w,h)</th><th>质检员</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 质检看板 -->
+    <section id="tab-monitor" class="tab-panel hidden">
+      <div class="toolbar">
+        <button id="monitorRefreshBtn" class="btn primary">强制刷新</button>
+        <span id="monitorTime" class="hint"></span>
+      </div>
+      <div class="summary" id="monitorSummary"></div>
+      <div id="monitorContent"></div>
+    </section>
+
+    <!-- 标签分布 -->
+    <section id="tab-dist" class="tab-panel hidden">
+      <div id="distContent"></div>
+    </section>
+
+    <!-- 图片搜索 -->
+    <section id="tab-search" class="tab-panel hidden">
+      <div class="toolbar">
+        <label>文件名：</label>
+        <input id="searchInput" placeholder="输入文件名或片段，如 20260301395050ra00000482">
+        <button id="searchBtn" class="btn primary">搜索</button>
+        <button id="searchBatchRejectBtn" class="btn danger">批量打回</button>
+        <button id="searchBatchPassBtn" class="btn success">批量通过</button>
+      </div>
+      <div class="summary" id="searchSummary"></div>
+      <div class="table-wrap">
+        <table id="searchTable" class="hidden">
+          <thead>
+            <tr><th class="ck"><input type="checkbox" id="searchSelectAll" title="全选"></th><th>图片</th><th>框数</th><th>状态</th><th>质检员</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 导出 -->
+    <section id="tab-export" class="tab-panel hidden">
+      <div class="toolbar">
+        <label>导出模式：</label>
+        <select id="exportMode">
+          <option value="full">全量 (json)</option>
+          <option value="passed">仅质检通过 (json)</option>
+          <option value="yolo">YOLO 格式</option>
+        </select>
+        <button id="exportBtn" class="btn primary">开始导出</button>
+      </div>
+      <div class="hint">导出会从平台实时生成 zip 并下载到本地。</div>
+    </section>
+
+    <!-- 归属修复 -->
+    <section id="tab-fix" class="tab-panel hidden">
+      <div class="toolbar">
+        <label>质检员：</label>
+        <select id="fixOwner"></select>
+        <button id="fixBtn" class="btn primary">恢复任务归属</button>
+      </div>
+      <div class="summary" id="fixSummary"></div>
+    </section>
+    </div>
+  </main>
+
+  <div id="previewModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span id="previewTitle">照片详情</span>
+        <button id="previewClose" class="icon-btn" title="关闭">×</button>
+      </div>
+      <div id="previewImageWrap" class="preview-image-wrap">
+        <img id="previewImg" alt="">
+        <canvas id="previewCanvas"></canvas>
+      </div>
+      <div id="previewInfo" class="detail-info">点击图片查看详情</div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

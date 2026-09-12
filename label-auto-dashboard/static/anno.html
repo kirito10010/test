@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>作业平台</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/anno.css">
+</head>
+<body>
+<header class="anno-topbar">
+  <div class="anno-title">作业平台</div>
+  <label class="anno-field">项目
+    <select id="annoProject"></select>
+  </label>
+  <label class="anno-field">作业员
+    <select id="annoReviewer"></select>
+  </label>
+  <div class="anno-spacer"></div>
+  <div class="anno-counts" id="annoCounts"></div>
+  <div class="anno-daily-stats" id="annoDailyStats"></div>
+  <button id="annoSettings" class="btn">设置</button>
+  <a class="btn link-btn" href="/">数据看板</a>
+  <a class="btn link-btn" href="/qc">质检平台</a>
+</header>
+
+<main class="anno-workspace">
+  <!-- 左侧：属性按钮 -->
+  <aside class="anno-side">
+    <div class="anno-cats" id="annoCats"></div>
+    <div class="anno-hint">左键拖动画框 · 右键拖动平移 · 单击选中 · 双击删除 · 快捷键选属性 · C保存</div>
+  </aside>
+
+  <!-- 中间：照片 -->
+  <section class="anno-main">
+    <div id="annoViewer" class="viewer full"><div class="empty">请选择图片</div></div>
+  </section>
+
+  <!-- 右侧：图片列表 -->
+  <aside class="anno-list-panel">
+    <div class="anno-filters">
+      <input id="annoSearch" placeholder="搜索文件名">
+      <select id="annoQcFilter"><option value="">全部质检员</option></select>
+    </div>
+    <div class="anno-list-tabs">
+      <button class="anno-tab active" data-status="unannotated">未作业<span class="anno-badge" id="badgeUnannotated"></span></button>
+      <button class="anno-tab" data-status="submitted">已提交<span class="anno-badge" id="badgeSubmitted"></span></button>
+      <button class="anno-tab" data-status="rejected">被打回<span class="anno-badge" id="badgeRejected"></span></button>
+    </div>
+    <div id="annoList" class="anno-list-items"></div>
+  </aside>
+</main>
+
+<!-- 属性快捷键设置 -->
+<div id="annoSettingsBox" class="settings hidden">
+  <div class="settings-box">
+    <div class="settings-head">
+      <span>属性快捷键设置</span>
+      <button id="annoSettingsClose" class="settings-close">×</button>
+    </div>
+    <div class="settings-body" id="annoSettingsBody"></div>
+    <div class="settings-foot">
+      <button id="annoSettingsReset" class="btn">恢复默认</button>
+      <button id="annoSettingsSave" class="btn primary">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 作业员登录 -->
+<div id="annoLogin" class="settings hidden">
+  <div class="settings-box">
+    <div class="settings-head">
+      <span>作业员登录 <span id="annoLoginName"></span></span>
+      <button id="annoLoginClose" class="settings-close">×</button>
+    </div>
+    <div class="settings-body">
+      <div class="hint">该作业员未内置登录，请输入其账号密码后查看数据</div>
+      <input id="annoLoginEmail" placeholder="邮箱（v_xxx@baidu.com）" style="width:100%;padding:8px;border:1px solid #ccd2d9;border-radius:6px;">
+      <input id="annoLoginPassword" type="password" placeholder="密码" style="width:100%;padding:8px;border:1px solid #ccd2d9;border-radius:6px;">
+    </div>
+    <div class="settings-foot">
+      <button id="annoLoginCancel" class="btn">取消</button>
+      <button id="annoLoginOk" class="btn primary">登录</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+<script src="/static/viewer.js"></script>
+<script src="/static/anno.js"></script>
+</body>
+</html>
