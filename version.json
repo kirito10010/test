@@ -1,0 +1,5 @@
+{
+  "version": "1.0.0",
+  "notes": "修复：作业员「已提交」数据误入「未作业」；未内置账号的质检员列表无数据。",
+  "download_url": "https://github.com/kirito10010/test/releases/download/v1.0.0/label-auto-v2.exe"
+}
