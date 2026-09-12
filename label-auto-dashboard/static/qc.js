@@ -3,6 +3,20 @@
 
 const $ = (id) => document.getElementById(id);
 
+const AUTH_KEY = 'la_auth';
+function getAuth() {
+  try { const raw = localStorage.getItem(AUTH_KEY); if (raw) return JSON.parse(raw); } catch (e) {}
+  return {};
+}
+function clearAuth() {
+  try { localStorage.removeItem(AUTH_KEY); } catch (e) {}
+}
+function logout() {
+  clearAuth();
+  location.href = '/';
+}
+let RELEASE = false;   // 发布版标志，由 /api/config 决定
+
 function toast(msg) {
   const t = $('toast');
   t.textContent = msg;
@@ -13,6 +27,10 @@ function toast(msg) {
 
 async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
+  const auth = getAuth();
+  if (auth.token) opts.headers['Authorization'] = 'Bearer ' + auth.token;
+  if (auth.user && auth.user.id) opts.headers['X-User-Id'] = auth.user.id;
+  if (auth.user && auth.user.role) opts.headers['X-User-Role'] = auth.user.role;
   if (opts.body && typeof opts.body === 'object') {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(opts.body);
@@ -107,8 +125,7 @@ function startDailyPoll() {
 function loadDailyStats() {
   const el = $('qcDailyStats');
   if (!el) return;
-  const r = state.reviewers.find((x) => x.uid === state.reviewerUid);
-  if (!uid() || !r || !r.has_login) { el.innerHTML = ''; el.classList.add('hidden'); return; }
+  if (!uid()) { el.innerHTML = ''; el.classList.add('hidden'); return; }
   api('/api/daily_stats?uid=' + encodeURIComponent(uid())).then((res) => {
     if (res && res.ok && res.has_login) {
       el.innerHTML = formatDailyStats('质检量', res.qc_days);
@@ -129,13 +146,33 @@ function formatDailyStats(title, days) {
 
 /* ============ 初始化 ============ */
 async function init() {
-  const r = await api('/api/qc/autologin');
-  if (!r || !r.ok) { toast((r && r.error) || '自动登录失败'); return; }
+  // 判断是否发布版
+  try {
+    const c = await api('/api/config');
+    RELEASE = !!(c && c.release);
+  } catch (e) {}
+  if (RELEASE) {
+    if (!getAuth().token) { location.href = '/'; return; }
+    applyReleaseUI();
+  } else {
+    const r = await api('/api/qc/autologin');
+    if (!r || !r.ok) { toast((r && r.error) || '自动登录失败'); return; }
+  }
   const s = await api('/api/qc/setup');
   if (!s || !s.ok) { toast('加载项目失败'); return; }
   state.setup = s.projects || [];
   renderProjectSelect();
   startDailyPoll();
+}
+
+function applyReleaseUI() {
+  // 发布版：去掉切换平台按钮，只留「退出」
+  const linkAnno = $('linkAnno');
+  const linkDashboard = $('linkDashboard');
+  const linkLogout = $('linkLogout');
+  if (linkAnno) linkAnno.classList.add('hidden');
+  if (linkDashboard) linkDashboard.classList.add('hidden');
+  if (linkLogout) linkLogout.classList.remove('hidden');
 }
 
 function renderProjectSelect() {
@@ -173,6 +210,9 @@ function renderReviewerSelect(reviewers) {
   sel.innerHTML = '';
   const prefs = loadPrefs();
   state.reviewers = reviewers || [];
+  // 发布版：非 admin 只有一个质检员（当前用户）时，隐藏「质检员」下拉
+  const field = sel.closest('.qc-field');
+  if (field) field.classList.toggle('hidden', RELEASE && reviewers.length <= 1);
   reviewers.forEach((r) => {
     const o = document.createElement('option');
     o.value = r.uid;
@@ -208,10 +248,12 @@ function onReviewerChange() {
   updateCatPickerField();
   loadAnnotatorOwners();
 
-  const r = state.reviewers.find((x) => x.uid === state.reviewerUid);
-  if (!isLocalHost() && r && !r.has_login) {
-    probeReviewerLogin();
-    return;
+  if (!RELEASE) {
+    const r = state.reviewers.find((x) => x.uid === state.reviewerUid);
+    if (!isLocalHost() && r && !r.has_login) {
+      probeReviewerLogin();
+      return;
+    }
   }
   $('reviewerLogin').classList.add('hidden');
   loadCounts();

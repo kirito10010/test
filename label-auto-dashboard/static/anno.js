@@ -3,6 +3,20 @@
 
 const $ = (id) => document.getElementById(id);
 
+const AUTH_KEY = 'la_auth';
+function getAuth() {
+  try { const raw = localStorage.getItem(AUTH_KEY); if (raw) return JSON.parse(raw); } catch (e) {}
+  return {};
+}
+function clearAuth() {
+  try { localStorage.removeItem(AUTH_KEY); } catch (e) {}
+}
+function logout() {
+  clearAuth();
+  location.href = '/';
+}
+let RELEASE = false;
+
 function toast(msg) {
   const t = $('toast');
   t.textContent = msg;
@@ -13,6 +27,10 @@ function toast(msg) {
 
 async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
+  const auth = getAuth();
+  if (auth.token) opts.headers['Authorization'] = 'Bearer ' + auth.token;
+  if (auth.user && auth.user.id) opts.headers['X-User-Id'] = auth.user.id;
+  if (auth.user && auth.user.role) opts.headers['X-User-Role'] = auth.user.role;
   if (opts.body && typeof opts.body === 'object') {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(opts.body);
@@ -123,8 +141,7 @@ function startDailyPoll() {
 function loadDailyStats() {
   const el = $('annoDailyStats');
   if (!el) return;
-  const a = state.annotators.find((x) => x.uid === state.uid);
-  if (!uid() || !a || !a.has_login) { el.innerHTML = ''; el.classList.add('hidden'); return; }
+  if (!uid()) { el.innerHTML = ''; el.classList.add('hidden'); return; }
   api('/api/daily_stats?uid=' + encodeURIComponent(uid())).then((res) => {
     if (res && res.ok && res.has_login) {
       el.innerHTML = formatDailyStats('标注量', res.annotated_days);
@@ -185,13 +202,32 @@ function applyFilters(items) {
 
 /* ============ 初始化 ============ */
 async function init() {
-  const r = await api('/api/autologin');
-  if (!r || !r.ok) { toast((r && r.error) || '自动登录失败'); return; }
+  try {
+    const c = await api('/api/config');
+    RELEASE = !!(c && c.release);
+  } catch (e) {}
+  if (RELEASE) {
+    if (!getAuth().token) { location.href = '/'; return; }
+    applyReleaseUI();
+  } else {
+    const r = await api('/api/autologin');
+    if (!r || !r.ok) { toast((r && r.error) || '自动登录失败'); return; }
+  }
   const s = await api('/api/anno/setup');
   if (!s || !s.ok) { toast('加载项目失败'); return; }
   state.setup = s.projects || [];
   renderProjectSelect();
   startDailyPoll();
+}
+
+function applyReleaseUI() {
+  // 发布版：去掉切换平台按钮，只留「退出」
+  const linkQc = $('linkQc');
+  const linkDashboard = $('linkDashboard');
+  const linkLogout = $('linkLogout');
+  if (linkQc) linkQc.classList.add('hidden');
+  if (linkDashboard) linkDashboard.classList.add('hidden');
+  if (linkLogout) linkLogout.classList.remove('hidden');
 }
 
 function renderProjectSelect() {
@@ -227,6 +263,9 @@ function renderAnnotatorSelect(annotators) {
   sel.innerHTML = '';
   const prefs = loadPrefs();
   state.annotators = annotators || [];
+  // 发布版：非 admin 只有一个作业员（当前用户）时，隐藏「作业员」下拉
+  const field = sel.closest('.anno-field');
+  if (field) field.classList.toggle('hidden', RELEASE && annotators.length <= 1);
   annotators.forEach((a) => {
     const o = document.createElement('option');
     o.value = a.uid;
@@ -253,10 +292,12 @@ function onAnnotatorChange() {
   loadDailyStats();
   state.qcFilter = '';
   loadQcOwners();
-  const a = state.annotators.find((x) => x.uid === state.uid);
-  if (!isLocalHost() && a && !a.has_login) {
-    probeLogin();
-    return;
+  if (!RELEASE) {
+    const a = state.annotators.find((x) => x.uid === state.uid);
+    if (!isLocalHost() && a && !a.has_login) {
+      probeLogin();
+      return;
+    }
   }
   $('annoLogin').classList.add('hidden');
   loadCounts();

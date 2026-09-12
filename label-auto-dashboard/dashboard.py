@@ -36,6 +36,13 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
     STATIC_DIR = os.path.join(HERE, "static")
 
+# 构建模式：由 PyInstaller runtime hook 注入环境变量区分。
+#   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
+#   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
+RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
+VERSION = "1.0.0"   # 发布版自更新用：当前版本号
+UPDATE_URL = ""     # 发布版自更新用：GitHub version.json 地址（发版前填真实地址）
+
 # ---------- 会话状态 ----------
 TOKEN = None
 USER = None
@@ -52,8 +59,9 @@ _RECENT_GROUPS = []
 _SAVE_PENDING = {}
 
 # 质检员/作业员登录凭据（用于以其本人 token 提交 /qc，使平台按 token 正确归属质检结果；
-# 也用于局域网访问时按「是否有内置账号」决定是否弹登录框）
-_QC_LOGIN = {
+# 也用于局域网访问时按「是否有内置账号」决定是否弹登录框）。
+# 发布版（release）清空：只留于荣华一个内置管理员（QC_EMAIL/QC_PASSWORD），供「改属性」等用其权限。
+_QC_LOGIN = {} if RELEASE_MODE else {
     # 质检员
     "68f4d0965cb3": {"email": "v_lijin10@baidu.com", "password": "pw123456"},              # 李劲
     "d82165faee87": {"email": "v_liqingguang01@baidu.com", "password": "pw123456"},        # 李庆广
@@ -90,6 +98,11 @@ def _get_qc_token(uid):
         except Exception:
             pass
     return None
+
+
+def _current_uid():
+    """当前登录用户 uid（发布版登录自己账号后，由请求头写入 USER）"""
+    return (USER or {}).get("id") or ""
 
 
 # ======================================================================
@@ -163,10 +176,12 @@ def _clear_cache_keep_stable():
 # ======================================================================
 # 数据获取
 # ======================================================================
-def get_projects():
-    data = cache_get("projects", ttl=1800)
+def get_projects(force=False):
+    data = None if force else cache_get("projects", ttl=1800)
     if data is None:
-        status, h, raw = upstream("GET", "/api/projects")
+        status, h, raw = upstream("GET", "/api/projects", token=_get_owner_token())
+        if status != 200:
+            raise RuntimeError("拉取项目列表失败 HTTP %s" % status)
         data = json.loads(raw.decode("utf-8"))
         cache_set("projects", data, ttl=1800)
     return data
@@ -174,6 +189,11 @@ def get_projects():
 
 def get_project(pid):
     proj = get_projects()
+    for p in proj.get("projects", []):
+        if p.get("id") == pid:
+            return p
+    # 缓存里没有（可能是刚新建的项目，快照滞后）→ 强制刷新一次再找
+    proj = get_projects(force=True)
     for p in proj.get("projects", []):
         if p.get("id") == pid:
             return p
@@ -185,7 +205,7 @@ def get_export_labels(pid, force=False):
     data = None if force else cache_get("export_" + pid, ttl=1800)
     if data is None:
         status, h, raw = upstream("GET", "/api/projects/%s/export" % pid,
-                                  query={"format": "json"})
+                                  query={"format": "json"}, token=_get_owner_token())
         if status != 200:
             raise RuntimeError("导出失败 HTTP %s：%s" % (status, raw[:200].decode('utf-8', 'ignore')))
         zf = zipfile.ZipFile(io.BytesIO(raw))
@@ -219,7 +239,8 @@ def _fetch_images_sync(pid):
         ent = _CACHE.get(key)
         if ent is not None:
             return ent[1]
-        status, h, raw = upstream("GET", "/api/projects/%s/images" % pid)
+        status, h, raw = upstream("GET", "/api/projects/%s/images" % pid,
+                                  token=_get_owner_token())
         if status != 200:
             # 拉取失败（token 失效/上游异常）时绝不缓存坏数据，否则会把列表/打回全部清空
             raise RuntimeError("拉取图片列表失败 HTTP %s" % status)
@@ -237,7 +258,8 @@ def _refresh_images_async(pid):
 
     def _run():
         try:
-            status, h, raw = upstream("GET", "/api/projects/%s/images" % pid)
+            status, h, raw = upstream("GET", "/api/projects/%s/images" % pid,
+                                      token=_get_owner_token())
             if status == 200:
                 data = json.loads(raw.decode("utf-8"))
                 cache_set("images_" + pid, data, ttl=180)
@@ -282,27 +304,57 @@ def _image_cache_put(pid, image_id, content_type, body):
             _IMAGE_CACHE.popitem(last=False)
 
 
+_OWNER_TOKEN = None
+_OWNER_TOKEN_LOCK = threading.Lock()
+
+
+def _get_owner_token():
+    """登录 owner（于荣华）并缓存 token；用于拉取 admin 接口（名字映射等）"""
+    global _OWNER_TOKEN
+    if _OWNER_TOKEN:
+        return _OWNER_TOKEN
+    with _OWNER_TOKEN_LOCK:
+        if _OWNER_TOKEN:
+            return _OWNER_TOKEN
+        s, h, raw = upstream("POST", "/api/login",
+                             body={"email": QC_EMAIL, "password": QC_PASSWORD})
+        if s == 200:
+            try:
+                d = json.loads(raw.decode("utf-8"))
+                _OWNER_TOKEN = d.get("token")
+                return _OWNER_TOKEN
+            except Exception:
+                pass
+    return None
+
+
 def get_monitoring():
     data = cache_get("monitoring", ttl=60)
     if data is None:
-        status, h, raw = upstream("GET", "/api/admin/monitoring")
+        status, h, raw = upstream("GET", "/api/admin/monitoring", token=_get_owner_token())
         data = json.loads(raw.decode("utf-8"))
         cache_set("monitoring", data, ttl=60)
     return data
 
 
+def get_users():
+    """全部用户 id -> display_name（来自 /api/admin/users），供名字映射"""
+    data = cache_get("users", ttl=300)
+    if data is None:
+        status, h, raw = upstream("GET", "/api/admin/users", token=_get_owner_token())
+        data = json.loads(raw.decode("utf-8"))
+        cache_set("users", data, ttl=300)
+    return data
+
+
 def build_uid_name_map():
-    """uid -> 名字，来自 monitoring 的 assignees/qc_assignees"""
+    """uid -> 名字，来自 /api/admin/users（display_name）"""
     m = {}
     try:
-        mon = get_monitoring()
-        for p in mon.get("projects", []):
-            for a in (p.get("qc_assignees") or []):
-                if isinstance(a, dict) and a.get("uid"):
-                    m[a["uid"]] = a.get("name") or a.get("email") or a["uid"]
-            for a in (p.get("assignees") or []):
-                if isinstance(a, dict) and a.get("uid"):
-                    m.setdefault(a["uid"], a.get("name") or a.get("email") or a["uid"])
+        d = get_users()
+        for u in d.get("users", []):
+            if isinstance(u, dict) and u.get("id"):
+                m[u["id"]] = u.get("display_name") or u.get("email") or u["id"]
     except Exception:
         pass
     return m
@@ -390,7 +442,7 @@ def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
             if ent and time.time() < ent[0]:
                 return img, ent[1]
         s, h, raw = upstream("GET", "/api/projects/%s/annotation" % pid,
-                             query={"image_id": img})
+                             query={"image_id": img}, token=_get_owner_token())
         try:
             d = json.loads(raw.decode("utf-8"))
             v = {"qc_status": d.get("qc_status") or "",
@@ -575,14 +627,26 @@ def search_images(pid, q):
 # 质检平台
 # ======================================================================
 def qc_setup():
-    """返回项目与各项目质检员（uid/name），供质检平台初始化"""
+    """返回项目与各项目质检员（uid/name），供质检平台初始化。
+    发布版（release）按当前登录用户锁定（admin 保留切换）。"""
     proj_data = get_projects()
-    mon_data = get_monitoring()
-    names = {}
-    for mp in mon_data.get("projects", []):
-        for a in mp.get("qc_assignees") or []:
-            if isinstance(a, dict) and a.get("uid"):
-                names.setdefault(a["uid"], a.get("name") or a.get("email") or a["uid"])
+    names = build_uid_name_map()
+    if RELEASE_MODE:
+        uid = _current_uid()
+        role = (USER or {}).get("role") or ""
+        is_admin = (role == "admin")
+        out = []
+        for p in proj_data.get("projects", []):
+            pid = p.get("id")
+            qc_assignees = p.get("qc_assignees") or []
+            if not is_admin and uid not in qc_assignees and uid not in (p.get("qc_assignments") or {}):
+                continue
+            reviewers = ([{"uid": u, "name": names.get(u, u), "has_login": False} for u in qc_assignees]
+                         if is_admin else
+                         [{"uid": uid, "name": names.get(uid, uid), "has_login": False}])
+            out.append({"id": pid, "name": p.get("name"), "reviewers": reviewers,
+                        "categories": p.get("categories") or []})
+        return out
     out = []
     for p in proj_data.get("projects", []):
         pid = p.get("id")
@@ -710,14 +774,26 @@ def qc_assigned(pid, uid, status, offset, limit, cat_names=None):
 
 
 def anno_setup():
-    """返回项目与各项目作业员（uid/name/has_login），供作业平台初始化"""
+    """返回项目与各项目作业员（uid/name/has_login），供作业平台初始化。
+    发布版（release）按当前登录用户锁定（admin 保留切换）。"""
     proj_data = get_projects()
-    mon_data = get_monitoring()
-    names = {}
-    for mp in mon_data.get("projects", []):
-        for a in mp.get("assignees") or []:
-            if isinstance(a, dict) and a.get("uid"):
-                names.setdefault(a["uid"], a.get("name") or a.get("email") or a["uid"])
+    names = build_uid_name_map()
+    if RELEASE_MODE:
+        uid = _current_uid()
+        role = (USER or {}).get("role") or ""
+        is_admin = (role == "admin")
+        out = []
+        for p in proj_data.get("projects", []):
+            pid = p.get("id")
+            assignees = p.get("assignees") or []
+            if not is_admin and uid not in assignees and uid not in (p.get("assignments") or {}):
+                continue
+            annotators = ([{"uid": u, "name": names.get(u, u), "has_login": False} for u in assignees]
+                          if is_admin else
+                          [{"uid": uid, "name": names.get(uid, uid), "has_login": False}])
+            out.append({"id": pid, "name": p.get("name"), "annotators": annotators,
+                        "categories": p.get("categories") or []})
+        return out
     out = []
     for p in proj_data.get("projects", []):
         pid = p.get("id")
@@ -729,12 +805,17 @@ def anno_setup():
 
 
 def daily_stats(uid):
-    """返回某内置账号的每日标注量/质检量；无内置登录返回 has_login=False"""
-    if not uid or uid not in _QC_LOGIN:
-        return {"ok": True, "has_login": False}
-    tok = _get_qc_token(uid)
-    if not tok:
-        return {"ok": False, "error": "无法登录该账号"}
+    """每日标注量/质检量。发布版用当前登录用户 token；开发版用所选内置账号 token。"""
+    if RELEASE_MODE:
+        if not TOKEN:
+            return {"ok": True, "has_login": False}
+        tok = TOKEN
+    else:
+        if not uid or uid not in _QC_LOGIN:
+            return {"ok": True, "has_login": False}
+        tok = _get_qc_token(uid)
+        if not tok:
+            return {"ok": False, "error": "无法登录该账号"}
     s, h, raw = upstream("GET", "/api/my_daily_stats", token=tok)
     try:
         d = json.loads(raw.decode("utf-8"))
@@ -960,7 +1041,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.client_address[0] in ("127.0.0.1", "::1")
 
     def _qc_gated(self, uid):
-        """局域网访问且质检员未内置登录且尚未登录时，返回「需要登录」响应；否则返回 None。"""
+        """质检/作业数据访问门槛。发布版只检查是否登录；开发版按内置/本地判断。"""
+        if RELEASE_MODE:
+            if TOKEN:
+                return None
+            return self._send_json({"ok": False, "need_login": True,
+                                    "error": "请先登录"}, 401)
         if self._is_local():
             return None
         if uid in _QC_LOGIN:
@@ -982,6 +1068,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
 
+        # 登录态由前端 localStorage 随请求头传来（发布版登录自己账号时用）
+        global TOKEN, USER
+        auth = self.headers.get("Authorization") or ""
+        if auth.startswith("Bearer "):
+            TOKEN = auth[len("Bearer "):]
+        uid_h = self.headers.get("X-User-Id") or ""
+        role_h = self.headers.get("X-User-Role") or ""
+        if uid_h or role_h:
+            USER = {"id": uid_h, "role": role_h}
+
         # 静态文件
         if path in ("/", "/index.html", "/qc", "/anno") or path.startswith("/static/"):
             return self._serve_static(path)
@@ -990,7 +1086,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/login" and method == "POST":
             return self._handle_login()
         if path == "/api/logout" and method == "POST":
-            global TOKEN, USER
             TOKEN = None
             USER = None
             _CACHE.clear()
@@ -999,17 +1094,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/me" and method == "GET":
             return self._send_json({"ok": True, "user": USER})
 
+        if path == "/api/config" and method == "GET":
+            return self._send_json({"ok": True, "release": RELEASE_MODE})
+
         if path == "/api/projects" and method == "GET":
             s, h, raw = upstream("GET", "/api/projects")
             return self._send(s, self._pick_headers(h), raw)
 
-        if path == "/api/monitoring" and method == "GET":
+        if not RELEASE_MODE and path == "/api/monitoring" and method == "GET":
             if qs.get("force"):
                 _CACHE.pop("monitoring", None)
             s, h, raw = upstream("GET", "/api/admin/monitoring")
             return self._send(s, self._pick_headers(h), raw)
 
-        if path == "/api/query_progress" and method == "GET":
+        if not RELEASE_MODE and path == "/api/query_progress" and method == "GET":
             return self._send_json({"ok": True, "progress": _PROGRESS})
 
         # ---- 自动登录（于荣华，看板与质检平台共用） ----
@@ -1180,10 +1278,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json(r, 200 if r.get("ok") else 400)
 
         # /api/projects/{id}/images
-        m = re.match(r"^/api/projects/([^/]+)/images$", path)
-        if m and method == "GET":
-            s, h, raw = upstream("GET", "/api/projects/%s/images" % m.group(1))
-            return self._send(s, self._pick_headers(h), raw)
+        if not RELEASE_MODE:
+            m = re.match(r"^/api/projects/([^/]+)/images$", path)
+            if m and method == "GET":
+                s, h, raw = upstream("GET", "/api/projects/%s/images" % m.group(1))
+                return self._send(s, self._pick_headers(h), raw)
 
         # /api/projects/{id}/image  /annotation
         m = re.match(r"^/api/projects/([^/]+)/(image|annotation)$", path)
@@ -1196,63 +1295,64 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s, h, raw = upstream("GET", "/api/projects/%s/annotation" % pid, query=query)
             return self._send(s, self._pick_headers(h), raw)
 
-        # /api/projects/{id}/query?cat=a,b&sort=reviewed_desc
-        m = re.match(r"^/api/projects/([^/]+)/query$", path)
-        if m and method == "GET":
-            cats = [c for c in (qs.get("cat", [""])[0]).split(",") if c] if qs.get("cat") else []
-            sort = qs.get("sort", [""])[0] or None
-            pm_raw = qs.get("passed_minutes", [""])[0]
-            try:
-                passed_minutes = int(pm_raw) if pm_raw else 0
-            except ValueError:
-                passed_minutes = 0
-            try:
-                return self._send_json({"ok": True, "results": query_images(m.group(1), cats, sort, passed_minutes)})
-            except RuntimeError as e:
-                return self._send_json({"ok": False, "error": str(e)}, 400)
+        if not RELEASE_MODE:
+            # /api/projects/{id}/query?cat=a,b&sort=reviewed_desc
+            m = re.match(r"^/api/projects/([^/]+)/query$", path)
+            if m and method == "GET":
+                cats = [c for c in (qs.get("cat", [""])[0]).split(",") if c] if qs.get("cat") else []
+                sort = qs.get("sort", [""])[0] or None
+                pm_raw = qs.get("passed_minutes", [""])[0]
+                try:
+                    passed_minutes = int(pm_raw) if pm_raw else 0
+                except ValueError:
+                    passed_minutes = 0
+                try:
+                    return self._send_json({"ok": True, "results": query_images(m.group(1), cats, sort, passed_minutes)})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
 
-        # /api/projects/{id}/leak?cats=a,b
-        m = re.match(r"^/api/projects/([^/]+)/leak$", path)
-        if m and method == "GET":
-            cats = [c for c in (qs.get("cats", [""])[0]).split(",") if c] if qs.get("cats") else []
-            try:
-                return self._send_json({"ok": True, "results": leak_images(m.group(1), cats)})
-            except RuntimeError as e:
-                return self._send_json({"ok": False, "error": str(e)}, 400)
+            # /api/projects/{id}/leak?cats=a,b
+            m = re.match(r"^/api/projects/([^/]+)/leak$", path)
+            if m and method == "GET":
+                cats = [c for c in (qs.get("cats", [""])[0]).split(",") if c] if qs.get("cats") else []
+                try:
+                    return self._send_json({"ok": True, "results": leak_images(m.group(1), cats)})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
 
-        # /api/projects/{id}/distribution
-        m = re.match(r"^/api/projects/([^/]+)/distribution$", path)
-        if m and method == "GET":
-            try:
-                return self._send_json({"ok": True, "distribution": distribution(m.group(1))})
-            except RuntimeError as e:
-                return self._send_json({"ok": False, "error": str(e)}, 400)
+            # /api/projects/{id}/distribution
+            m = re.match(r"^/api/projects/([^/]+)/distribution$", path)
+            if m and method == "GET":
+                try:
+                    return self._send_json({"ok": True, "distribution": distribution(m.group(1))})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
 
-        # /api/projects/{id}/search?q=文件名子串
-        m = re.match(r"^/api/projects/([^/]+)/search$", path)
-        if m and method == "GET":
-            q = qs.get("q", [""])[0]
-            if not q:
-                return self._send_json({"ok": False, "error": "缺少 q 参数"}, 400)
-            try:
-                return self._send_json({"ok": True, "results": search_images(m.group(1), q)})
-            except RuntimeError as e:
-                return self._send_json({"ok": False, "error": str(e)}, 400)
+            # /api/projects/{id}/search?q=文件名子串
+            m = re.match(r"^/api/projects/([^/]+)/search$", path)
+            if m and method == "GET":
+                q = qs.get("q", [""])[0]
+                if not q:
+                    return self._send_json({"ok": False, "error": "缺少 q 参数"}, 400)
+                try:
+                    return self._send_json({"ok": True, "results": search_images(m.group(1), q)})
+                except RuntimeError as e:
+                    return self._send_json({"ok": False, "error": str(e)}, 400)
 
-        # /api/projects/{id}/preload  (GET，无操作，保留以兼容前端切换项目时的调用)
-        m = re.match(r"^/api/projects/([^/]+)/preload$", path)
-        if m and method == "GET":
-            return self._send_json({"ok": True})
+            # /api/projects/{id}/preload  (GET，无操作，保留以兼容前端切换项目时的调用)
+            m = re.match(r"^/api/projects/([^/]+)/preload$", path)
+            if m and method == "GET":
+                return self._send_json({"ok": True})
 
-        # /api/export/{id}?mode=passed|full|yolo
-        m = re.match(r"^/api/export/([^/]+)$", path)
-        if m and method == "GET":
-            return self._export(m.group(1), qs.get("mode", ["full"])[0])
+            # /api/export/{id}?mode=passed|full|yolo
+            m = re.match(r"^/api/export/([^/]+)$", path)
+            if m and method == "GET":
+                return self._export(m.group(1), qs.get("mode", ["full"])[0])
 
-        # /api/projects/{id}/batch_qc  (POST)
-        m = re.match(r"^/api/projects/([^/]+)/batch_qc$", path)
-        if m and method == "POST":
-            return self._handle_batch_qc(m.group(1))
+            # /api/projects/{id}/batch_qc  (POST)
+            m = re.match(r"^/api/projects/([^/]+)/batch_qc$", path)
+            if m and method == "POST":
+                return self._handle_batch_qc(m.group(1))
 
         return self._send_json({"ok": False, "error": "未知接口: " + path}, 404)
 
@@ -1444,7 +1544,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ---- 静态文件 ----
     def _serve_static(self, path):
         if path == "/":
-            path = "/index.html"
+            path = "/login.html" if RELEASE_MODE else "/index.html"
         elif path == "/qc":
             path = "/qc.html"
         elif path == "/anno":
@@ -1498,6 +1598,66 @@ def _run_tray(httpd, url):
     return True
 
 
+# ======================================================================
+# 发布版自更新（每 10 分钟检查一次）
+# ======================================================================
+def _version_tuple(v):
+    parts = re.findall(r"\d+", str(v or ""))
+    return tuple(int(x) for x in parts) or (0,)
+
+
+def _check_update():
+    if not UPDATE_URL:
+        return
+    try:
+        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "label-auto-updater"})
+        d = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+        new_ver = d.get("version") or ""
+        if _version_tuple(new_ver) > _version_tuple(VERSION):
+            _prompt_update(new_ver, d.get("notes") or "", d.get("download_url") or "")
+    except Exception:
+        pass  # 无网络/拉取失败静默跳过
+
+
+def _prompt_update(version, notes, url):
+    if not url:
+        return
+    try:
+        import ctypes
+        msg = "发现新版本 %s\n\n%s\n\n是否立即更新？" % (version, notes or "（无更新说明）")
+        MB_YESNO = 0x04
+        MB_ICONQUESTION = 0x20
+        r = ctypes.windll.user32.MessageBoxW(0, msg, "标注平台更新", MB_YESNO | MB_ICONQUESTION)
+        if r == 6:  # IDYES
+            _do_update(url)
+    except Exception:
+        pass
+
+
+def _do_update(url):
+    try:
+        exe_path = sys.executable
+        new_path = exe_path + ".new"
+        urllib.request.urlretrieve(url, new_path)
+        bat = exe_path + ".update.bat"
+        with open(bat, "w", encoding="utf-8") as f:
+            f.write('@echo off\n')
+            f.write('timeout /t 2 /nobreak >nul\n')
+            f.write('move /y "%s" "%s"\n' % (new_path, exe_path))
+            f.write('start "" "%s"\n' % exe_path)
+            f.write('del "%~f0"\n')
+        os.startfile(bat)
+        os._exit(0)
+    except Exception:
+        pass
+
+
+def _update_loop():
+    while True:
+        _check_update()
+        time.sleep(600)
+
+
 def main():
     httpd = None
     port = PORT_START
@@ -1514,6 +1674,8 @@ def main():
     base = "http://127.0.0.1:%d" % port
     url = base + "/qc"
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    if RELEASE_MODE:
+        threading.Thread(target=_update_loop, daemon=True).start()
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     if not _run_tray(httpd, url):
         # 托盘不可用时回退：阻塞服务（Ctrl+C 或任务管理器结束）
