@@ -1,5 +1,5 @@
 {
-  "version": "1.1.2",
-  "notes": "测试自动更新流程：1.1.1 → 1.1.2。",
-  "download_url": "https://github.com/kirito10010/test/releases/download/v1.1.2/label-auto-v2.exe"
+  "version": "1.1.3",
+  "notes": "测试自动更新：1.1.2 → 1.1.3，验证进度条与安装完成提示。",
+  "download_url": "https://github.com/kirito10010/test/releases/download/v1.1.3/label-auto-v2.exe"
 }
