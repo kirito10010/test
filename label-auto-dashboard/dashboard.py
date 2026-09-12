@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.1.3"   # 发布版自更新用：当前版本号
+VERSION = "1.1.4"   # 发布版自更新用：当前版本号
 UPDATE_URL = "https://raw.githubusercontent.com/kirito10010/test/main/version.json"
 
 # ---------- 会话状态 ----------
@@ -1732,6 +1732,7 @@ def _do_update(url):
             f.write('timeout /t 3 /nobreak >nul\n')
             f.write('move /y "%~1" "%~2"\n')
             f.write('if errorlevel 1 goto fail\n')
+            f.write('set PYINSTALLER_RESET_ENVIRONMENT=1\n')
             f.write('start "" "%~2"\n')
             f.write('del "%~f0"\n')
             f.write('exit\n')
