@@ -1,5 +1,5 @@
 {
-  "version": "1.1.1",
-  "notes": "修复自动更新：下载失败静默、无进度反馈的问题。",
-  "download_url": "https://github.com/kirito10010/test/releases/download/v1.1.1/label-auto-v2.exe"
+  "version": "1.1.2",
+  "notes": "测试自动更新流程：1.1.1 → 1.1.2。",
+  "download_url": "https://github.com/kirito10010/test/releases/download/v1.1.2/label-auto-v2.exe"
 }

@@ -31,7 +31,7 @@ QC_PASSWORD = "pw123456"
 # 打包成 exe（PyInstaller 冻结）时：静态文件在临时解压目录 _MEIPASS 里。
 if getattr(sys, "frozen", False):
     HERE = os.path.dirname(os.path.abspath(sys.executable))
-    STATIC_DIR = os.path.join(sys._MEIPASS, "static")
+    STATIC_DIR = os.path.join(getattr(sys, "_MEIPASS", HERE), "static")
 else:
     HERE = os.path.dirname(os.path.abspath(__file__))
     STATIC_DIR = os.path.join(HERE, "static")
@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.1.1"   # 发布版自更新用：当前版本号
+VERSION = "1.1.2"   # 发布版自更新用：当前版本号
 UPDATE_URL = "https://raw.githubusercontent.com/kirito10010/test/main/version.json"
 
 # ---------- 会话状态 ----------
@@ -972,7 +972,7 @@ def anno_counts(pid, uid):
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "LabelAutoDashboard/1.0"
 
-    def log_message(self, fmt, *args):
+    def log_message(self, format, *args):
         pass  # 静默，避免刷屏
 
     # ---- 基础响应 ----
@@ -1573,7 +1573,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def _tray_image():
     if getattr(sys, "frozen", False):
-        p = os.path.join(sys._MEIPASS, "eternal-night-studio.ico")
+        p = os.path.join(getattr(sys, "_MEIPASS", HERE), "eternal-night-studio.ico")
     else:
         p = os.path.join(HERE, "eternal-night-studio.ico")
     return Image.open(p)
