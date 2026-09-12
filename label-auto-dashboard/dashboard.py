@@ -1642,30 +1642,104 @@ def _msgbox(title, text, flags=0):
         pass
 
 
+def _download_with_progress(url, new_path):
+    """下载新版本并显示进度条窗口；返回 (ok, error)。"""
+    import tkinter as tk
+    from tkinter import ttk
+    import queue
+
+    q = queue.Queue()
+
+    def _worker():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "label-auto-updater"})
+            resp = urllib.request.urlopen(req, timeout=300)
+            total = int(resp.headers.get("Content-Length") or 0)
+            done = 0
+            with open(new_path, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    q.put(("progress", done, total))
+            q.put(("done", True, None))
+        except Exception as e:
+            q.put(("done", False, e))
+
+    root = tk.Tk()
+    root.title("更新")
+    root.resizable(False, False)
+    root.attributes("-topmost", True)
+    label = tk.Label(root, text="正在下载更新…", width=26)
+    label.pack(padx=24, pady=(16, 8))
+    progress = ttk.Progressbar(root, length=380, mode="determinate")
+    progress.pack(padx=24, pady=(0, 16))
+    root.update_idletasks()
+    w = root.winfo_reqwidth()
+    h = root.winfo_reqheight()
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    root.geometry("+%d+%d" % (x, y))
+
+    final = {"ok": False, "error": None}
+
+    def _poll():
+        try:
+            while True:
+                msg = q.get_nowait()
+                if msg[0] == "progress":
+                    _, done, total = msg
+                    if total:
+                        progress.configure(maximum=total)
+                        progress.configure(value=done)
+                        label.configure(text="正在下载更新… %d%%" % int(done * 100 / total))
+                elif msg[0] == "done":
+                    _, ok, err = msg
+                    final["ok"] = ok
+                    final["error"] = err
+                    root.destroy()
+                    return
+        except queue.Empty:
+            pass
+        root.after(60, _poll)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    root.after(60, _poll)
+    root.mainloop()
+    return final["ok"], final["error"]
+
+
 def _do_update(url):
     try:
         exe_path = sys.executable
         new_path = exe_path + ".new"
-        # 点击后先给反馈，否则静默下载期间用户以为没反应
-        _msgbox("更新", "正在下载新版本，完成后会自动重启，请稍候…", 0x40)  # MB_ICONINFORMATION
-        # 下载：带 UA（与拉 version.json 一致），GitHub 会 302 到 release-assets，urlopen 自动跟随
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "label-auto-updater"})
-            with urllib.request.urlopen(req, timeout=300) as resp, open(new_path, "wb") as f:
-                f.write(resp.read())
-        except Exception as e:
-            _msgbox("更新失败", "下载新版本失败：\n%s" % e, 0x10)  # MB_ICONERROR
+        ok, err = _download_with_progress(url, new_path)
+        if not ok:
+            _msgbox("更新失败", "下载新版本失败：\n%s" % err, 0x10)  # MB_ICONERROR
             return
+        # 写「安装完成」标记，新版本启动时据此提示
+        try:
+            with open(exe_path + ".updated", "w", encoding="utf-8") as f:
+                f.write("1")
+        except Exception:
+            pass
+        # 替换脚本：路径经参数传入（%~1/%~2），bat 本身纯 ASCII，避免中文路径乱码
         bat = exe_path + ".update.bat"
-        with open(bat, "w", encoding="utf-8") as f:
+        with open(bat, "w", encoding="ascii") as f:
             f.write('@echo off\n')
             f.write('timeout /t 3 /nobreak >nul\n')
-            f.write('move /y "%s" "%s"\n' % (new_path, exe_path))
-            f.write('start "" "%s"\n' % exe_path)
+            f.write('move /y "%~1" "%~2"\n')
+            f.write('if errorlevel 1 goto fail\n')
+            f.write('start "" "%~2"\n')
+            f.write('del "%~f0"\n')
+            f.write('exit\n')
+            f.write(':fail\n')
             f.write('del "%~f0"\n')
         import subprocess
         # DETACHED_PROCESS：bat 在后台静默执行，不闪黑窗
-        subprocess.Popen(['cmd.exe', '/c', bat], creationflags=0x00000008)
+        subprocess.Popen(['cmd.exe', '/c', bat, new_path, exe_path], creationflags=0x00000008)
         os._exit(0)
     except Exception as e:
         _msgbox("更新失败", str(e), 0x10)
@@ -1677,7 +1751,22 @@ def _update_loop():
         time.sleep(600)
 
 
+def _maybe_show_updated_notice():
+    """更新完成后的首次启动：提示「安装完成」，并清理标记文件。"""
+    try:
+        flag = sys.executable + ".updated"
+        if os.path.exists(flag):
+            try:
+                os.remove(flag)
+            except Exception:
+                pass
+            _msgbox("更新完成", "已更新到版本 %s" % VERSION, 0x40)  # MB_ICONINFORMATION
+    except Exception:
+        pass
+
+
 def main():
+    _maybe_show_updated_notice()
     httpd = None
     port = PORT_START
     for p in range(PORT_START, PORT_START + 30):
