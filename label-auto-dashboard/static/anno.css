@@ -70,8 +70,24 @@ body {
 .anno-filters select {
   max-width: 130px; padding: 6px 6px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 12px;
 }
-.anno-item-name { word-break: break-all; }
 .anno-qc-tag { font-size: 11px; color: #888; margin-top: 3px; }
+.anno-item-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.anno-item-name {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.anno-box-count {
+  flex-shrink: 0; padding: 0 6px;
+  font-size: 11px; color: #2b6de8; background: #e6effc;
+  border-radius: 10px;
+}
+.anno-copy-btn {
+  flex-shrink: 0; padding: 0 6px;
+  font-size: 11px; line-height: 18px;
+  color: #2b6de8; background: #fff;
+  border: 1px solid #ccd2d9; border-radius: 4px; cursor: pointer;
+}
+.anno-copy-btn:hover { background: #e6effc; }
 .anno-tab {
   flex: 1; padding: 6px 10px; border: 1px solid #ccd2d9; border-radius: 6px;
   background: #fff; cursor: pointer; font-size: 13px; position: relative;
@@ -90,7 +106,7 @@ body {
 .anno-list-items { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
 .anno-item {
   padding: 10px 12px; border: 1px solid #e3e6ea; border-radius: 8px; font-size: 13px;
-  line-height: 1.5; cursor: pointer; word-break: break-all; min-height: 42px; flex-shrink: 0;
+  line-height: 1.5; cursor: pointer; min-height: 42px; flex-shrink: 0;
 }
 .anno-item:hover { background: #f4f5f7; }
 .anno-item.active { background: #e6effc; border-color: #2b6de8; }

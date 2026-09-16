@@ -7,6 +7,24 @@ function colorFor(cat) {
   return 'hsl(' + h + ',70%,45%)';
 }
 
+/* 复制到剪贴板（带 execCommand 兜底），返回 Promise 供调用方提示成功 */
+function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text).catch(() => fallbackCopyText(text));
+  }
+  return Promise.resolve(fallbackCopyText(text));
+}
+function fallbackCopyText(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+}
+
 /* ============ 图片查看器（缩放平移 + 框叠加 + 框编辑/画框） ============ */
 function createViewer(container, imageUrl, boxes, opts) {
   opts = opts || {};

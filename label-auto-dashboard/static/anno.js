@@ -27,10 +27,12 @@ function toast(msg) {
 
 async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
-  const auth = getAuth();
-  if (auth.token) opts.headers['Authorization'] = 'Bearer ' + auth.token;
-  if (auth.user && auth.user.id) opts.headers['X-User-Id'] = auth.user.id;
-  if (auth.user && auth.user.role) opts.headers['X-User-Role'] = auth.user.role;
+  if (RELEASE) {
+    const auth = getAuth();
+    if (auth.token) opts.headers['Authorization'] = 'Bearer ' + auth.token;
+    if (auth.user && auth.user.id) opts.headers['X-User-Id'] = auth.user.id;
+    if (auth.user && auth.user.role) opts.headers['X-User-Role'] = auth.user.role;
+  }
   if (opts.body && typeof opts.body === 'object') {
     opts.headers['Content-Type'] = 'application/json';
     opts.body = JSON.stringify(opts.body);
@@ -413,7 +415,8 @@ async function loadList() {
   if (!items.length) {
     listEl.innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
   }
-  items.forEach((id) => makeListItem(id, (state.qcOf[id] || {}).name));
+  const boxCounts = (r && r.box_counts) || {};
+  items.forEach((id) => makeListItem(id, (state.qcOf[id] || {}).name, boxCounts[id]));
   // 预加载前几张图片，减少切换时闪黑
   items.slice(0, 4).forEach((id) => prefetchImage(id));
   return items;
@@ -441,20 +444,45 @@ async function loadCounts() {
   $('badgeRejected').textContent = c.rejected;
 }
 
-function makeListItem(id, qcName) {
+function makeListItem(id, qcName, boxCount) {
   const item = document.createElement('div');
   item.className = 'anno-item';
   item.dataset.id = id;
-  const nameEl = document.createElement('div');
+
+  // 第一行：文件名（超长缩略 + 悬浮显示全名）+ 框数 + 复制按钮
+  const row1 = document.createElement('div');
+  row1.className = 'anno-item-row';
+  const nameEl = document.createElement('span');
   nameEl.className = 'anno-item-name';
   nameEl.textContent = id;
-  item.appendChild(nameEl);
+  nameEl.title = id;   // 鼠标悬浮显示完整文件名
+  row1.appendChild(nameEl);
+  if (boxCount != null) {
+    const bc = document.createElement('span');
+    bc.className = 'anno-box-count';
+    bc.textContent = boxCount + ' 框';
+    row1.appendChild(bc);
+  }
+  const copyBtn = document.createElement('button');
+  copyBtn.className = 'anno-copy-btn';
+  copyBtn.type = 'button';
+  copyBtn.textContent = '复制';
+  copyBtn.title = '复制文件名';
+  copyBtn.onclick = (e) => {
+    e.stopPropagation();
+    copyTextToClipboard(id).then(() => toast('已复制文件名'));
+  };
+  row1.appendChild(copyBtn);
+  item.appendChild(row1);
+
+  // 第二行：质检人
   if (qcName) {
     const tag = document.createElement('div');
     tag.className = 'anno-qc-tag';
     tag.textContent = '质检：' + qcName;
     item.appendChild(tag);
   }
+
   item.onclick = () => loadImage(id);
   $('annoList').appendChild(item);
 }

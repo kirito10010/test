@@ -1,5 +1,5 @@
 {
-  "version": "1.1.4",
-  "notes": "修复更新后启动报安全校验错误的问题。",
-  "download_url": "https://github.com/kirito10010/test/releases/download/v1.1.4/label-auto-v2.exe"
+  "version": "1.2.0",
+  "notes": "新增：列表显示框数、2 行列表 + 复制文件名；修复：看板 403、开发版误发旧登录 token。",
+  "download_url": "https://github.com/kirito10010/test/releases/download/v1.2.0/label-auto-v2.exe"
 }

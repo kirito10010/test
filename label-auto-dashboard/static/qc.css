@@ -126,15 +126,31 @@ body {
 .qc-list-items { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
 .qc-item {
   padding: 10px 12px; border: 1px solid #e3e6ea; border-radius: 8px; font-size: 13px;
-  line-height: 1.5; cursor: pointer; word-break: break-all; min-height: 42px; flex-shrink: 0;
+  line-height: 1.5; cursor: pointer; min-height: 42px; flex-shrink: 0;
   /* 列表量大时（上千条）只渲染可视区，避免每次通过/切图都重排整列导致卡顿 */
   content-visibility: auto;
   contain-intrinsic-size: auto 54px;
 }
 .qc-item:hover { background: #f4f5f7; }
 .qc-item.active { background: #e6effc; border-color: #2b6de8; }
-.qc-item-name { word-break: break-all; }
 .qc-ann-tag { font-size: 11px; color: #888; margin-top: 3px; }
+.qc-item-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.qc-item-name {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.qc-box-count {
+  flex-shrink: 0; padding: 0 6px;
+  font-size: 11px; color: #2b6de8; background: #e6effc;
+  border-radius: 10px;
+}
+.qc-copy-btn {
+  flex-shrink: 0; padding: 0 6px;
+  font-size: 11px; line-height: 18px;
+  color: #2b6de8; background: #fff;
+  border: 1px solid #ccd2d9; border-radius: 4px; cursor: pointer;
+}
+.qc-copy-btn:hover { background: #e6effc; }
 
 .empty { padding: 40px; text-align: center; color: #999; }
 

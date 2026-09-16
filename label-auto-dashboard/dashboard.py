@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.1.4"   # 发布版自更新用：当前版本号
+VERSION = "1.2.0"   # 发布版自更新用：当前版本号
 UPDATE_URL = "https://raw.githubusercontent.com/kirito10010/test/main/version.json"
 
 # ---------- 会话状态 ----------
@@ -744,10 +744,12 @@ def qc_assigned(pid, uid, status, offset, limit, cat_names=None):
     files = (proj.get("qc_assignments") or {}).get(uid) or []
     imgs = get_images(pid)
     status_map = {}
+    box_map = {}
     for im in imgs.get("images", []):
         iid = im.get("image_id")
         if iid:
             status_map[iid] = im.get("qc_status")
+            box_map[iid] = im.get("box_count") or 0
     overrides = get_overrides(pid, uid)
     save_pending = _SAVE_PENDING.get(pid) or set()
     cat_bases = category_match_bases(pid, cat_names) if cat_names else None
@@ -770,7 +772,8 @@ def qc_assigned(pid, uid, status, offset, limit, cat_names=None):
             matched.append(f)
     total = len(matched)
     items = matched[offset:offset + limit]
-    return {"total": total, "items": items}
+    box_counts = {f: box_map.get(f, 0) for f in items}
+    return {"total": total, "items": items, "box_counts": box_counts}
 
 
 def anno_setup():
@@ -901,7 +904,8 @@ def anno_assigned(pid, uid, status, offset, limit):
     for im in imgs.get("images", []):
         iid = im.get("image_id")
         if iid:
-            info[iid] = {"annotated": im.get("annotated"), "qc_status": im.get("qc_status")}
+            info[iid] = {"annotated": im.get("annotated"), "qc_status": im.get("qc_status"),
+                         "box_count": im.get("box_count") or 0}
     save_pending = _SAVE_PENDING.get(pid) or set()
     rejected_bases = anno_rejected_bases(pid)
     matched = []
@@ -928,7 +932,8 @@ def anno_assigned(pid, uid, status, offset, limit):
                 matched.append(f)
     total = len(matched)
     items = matched[offset:offset + limit]
-    return {"total": total, "items": items}
+    box_counts = {f: (info.get(f) or {}).get("box_count", 0) for f in items}
+    return {"total": total, "items": items, "box_counts": box_counts}
 
 
 def anno_counts(pid, uid):
@@ -1098,13 +1103,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "release": RELEASE_MODE})
 
         if path == "/api/projects" and method == "GET":
-            s, h, raw = upstream("GET", "/api/projects")
+            s, h, raw = upstream("GET", "/api/projects", token=_get_owner_token())
             return self._send(s, self._pick_headers(h), raw)
 
         if not RELEASE_MODE and path == "/api/monitoring" and method == "GET":
             if qs.get("force"):
                 _CACHE.pop("monitoring", None)
-            s, h, raw = upstream("GET", "/api/admin/monitoring")
+            s, h, raw = upstream("GET", "/api/admin/monitoring", token=_get_owner_token())
             return self._send(s, self._pick_headers(h), raw)
 
         if not RELEASE_MODE and path == "/api/query_progress" and method == "GET":
