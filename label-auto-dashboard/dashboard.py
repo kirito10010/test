@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.2.0"   # 发布版自更新用：当前版本号
+VERSION = "1.2.1"   # 发布版自更新用：当前版本号
 UPDATE_URL = "https://raw.githubusercontent.com/kirito10010/test/main/version.json"
 
 # ---------- 会话状态 ----------
@@ -716,9 +716,11 @@ def qc_recent(pid, uid):
 
 
 def qc_save(pid, image_id, boxes):
-    """保存某张图的标注框（整体替换）。返回 {ok, box_count} 或 {ok, error}"""
+    """保存某张图的标注框（整体替换）。返回 {ok, box_count} 或 {ok, error}
+    用 owner（管理员）token 保存：质检员本人无「保存标注」权限，需以管理员身份落框。"""
     s, h, raw = upstream("POST", "/api/projects/%s/save" % pid,
-                         body={"image_id": image_id, "boxes": boxes})
+                         body={"image_id": image_id, "boxes": boxes},
+                         token=_get_owner_token())
     try:
         d = json.loads(raw.decode("utf-8"))
     except Exception:
@@ -994,7 +996,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
     def _send_json(self, obj, status=200):
-        self._send(status, {"Content-Type": "application/json; charset=utf-8"},
+        self._send(status, {"Content-Type": "application/json; charset=utf-8",
+                            "Cache-Control": "no-store"},
                    json_bytes(obj))
 
     def _serve_image(self, pid, query):
@@ -1564,7 +1567,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "jpeg": "image/jpeg", "svg": "image/svg+xml", "json": "application/json"}.get(ext, "application/octet-stream")
         with open(fp, "rb") as f:
             body = f.read()
-        return self._send(200, {"Content-Type": ctype}, body)
+        return self._send(200, {"Content-Type": ctype,
+                                "Cache-Control": "no-cache, no-store, must-revalidate"}, body)
 
     @staticmethod
     def _pick_headers(h):
