@@ -154,7 +154,7 @@ main.workspace {
   border-radius: 6px;
 }
 .toolbar input#queryCat { min-width: 260px; }
-.toolbar input#leakCats { min-width: 300px; }
+.toolbar input#fpCats { min-width: 300px; }
 
 .summary {
   margin-bottom: 12px;
@@ -194,6 +194,7 @@ td.ck input { cursor: pointer; }
 .badge.passed { background: var(--passed); }
 .badge.pending { background: var(--pending); }
 .badge.rejected { background: var(--rejected); }
+.badge.unannotated { background: var(--muted); }
 .badge.unknown { background: var(--muted); }
 
 /* 看板卡片 */

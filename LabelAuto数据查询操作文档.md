@@ -173,6 +173,6 @@ curl.exe -s -m 15 "http://172.21.205.141:8771/api/projects/72284c4b8322/annotati
 
 ## 9. 常见结果含义
 
-- `qc_status=passed`：质检通过（若还带「前挡玻璃遮挡」框 = 漏标，需关注）
+- `qc_status=passed`：质检通过（若还带「前挡玻璃遮挡」框 = 误通过，需关注）
 - `qc_status=pending`：待质检（还没处理）
 - `qc_status=rejected`：已打回（质检员已发现问题打回）

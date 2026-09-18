@@ -253,8 +253,15 @@ function renderQuery(results) {
   if (owner) rows = rows.filter(r => r.qc_owner === owner);
 
   const totalBoxes = rows.reduce((s, r) => s + (r.box_count != null ? r.box_count : r.boxes.length), 0);
+  const unannotated = results.filter(r => r.qc_status === 'unannotated').length;
   $('querySummary').innerHTML =
-    `命中 <strong>${results.length}</strong> 张图，筛选后 <strong>${rows.length}</strong> 张（框数 ${totalBoxes}）`;
+    `命中 <strong>${results.length}</strong> 张图` +
+    (unannotated ? `（未作业 ${unannotated}）` : '') +
+    `，筛选后 <strong>${rows.length}</strong> 张（框数 ${totalBoxes}）`;
+  // 未作业的图没有任何人工标注，选标签时必然查不到，说明原因而不是让人以为坏了
+  if (status === 'unannotated' && selectedLabels.size && rows.length === 0) {
+    $('querySummary').innerHTML += '<div class="hint">未作业的图还没有人工标注，无法命中标签；清空标签后可查看本项目全部未作业图。</div>';
+  }
 
   const tbody = $('queryTable').querySelector('tbody');
   tbody.innerHTML = '';
@@ -263,11 +270,8 @@ function renderQuery(results) {
     const tr = document.createElement('tr');
     tr.className = 'clickable';
     tr.onclick = () => openPreview(r.image_id);
-    const boxes = (r.boxes && r.boxes.length)
-      ? r.boxes.map(b => `(${b.x},${b.y},${b.w},${b.h})`).join('；')
-      : `${r.box_count != null ? r.box_count : r.boxes.length} 框`;
     tr.innerHTML = `<td class="ck"><input type="checkbox" class="rowCheck" data-id="${escapeHtml(r.image_id)}"></td>` +
-      `<td>${escapeHtml(r.image_id)}</td><td>${escapeHtml(boxes)}</td>` +
+      `<td>${escapeHtml(r.image_id)}</td><td>${escapeHtml(boxesText(r))}</td>` +
       `<td><span class="badge ${escapeHtml(r.qc_status || 'unknown')}">${statusText(r.qc_status)}</span></td>` +
       `<td>${escapeHtml(r.qc_owner || '-')}</td>` +
       `<td>${escapeHtml(r.reviewed_at || '-')}</td>`;
@@ -276,6 +280,17 @@ function renderQuery(results) {
   });
   $('querySelectAll').checked = false;
   updateQueryCount();
+}
+
+/* 框列文案：未作业行没有人工框，显示模型预标注框数 */
+function boxesText(r) {
+  if (r.qc_status === 'unannotated') {
+    return r.box_count > 0 ? `预标注 ${r.box_count} 框` : '无标注';
+  }
+  if (r.boxes && r.boxes.length) {
+    return r.boxes.map(b => `(${b.x},${b.y},${b.w},${b.h})`).join('；');
+  }
+  return `${r.box_count != null ? r.box_count : r.boxes.length} 框`;
 }
 
 function getSelectedIds(scope) {
@@ -315,22 +330,27 @@ function updateSearchCount() {
 }
 
 function statusText(s) {
-  return { passed: '已通过', pending: '待质检', rejected: '已打回' }[s] || s || '未知';
+  return { unannotated: '未作业', passed: '已通过', pending: '待质检', rejected: '已打回' }[s] || s || '未知';
 }
 
-/* ============ 漏标 ============ */
-async function doLeak() {
-  const cats = $('leakCats').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
-  if (!cats.length) return toast('请填写异常标签');
+/* ============ 误通过核查 ============ */
+async function doFalsePass() {
+  const cats = $('fpCats').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
+  if (!cats.length) return toast('请填写禁止出现的标签');
   if (!state.currentProjectId) return toast('请先选择项目');
-  toast('扫描漏标中…');
-  const r = await api('/api/projects/' + state.currentProjectId + '/leak?cats=' + encodeURIComponent(cats.join(',')));
-  if (!r || !r.ok) { toast((r && r.error) || '扫描失败'); return; }
+  toast('核查中…');
+  const r = await api('/api/projects/' + state.currentProjectId + '/false_pass?cats=' + encodeURIComponent(cats.join(',')));
+  if (!r || !r.ok) {
+    $('fpSummary').innerHTML = '';
+    $('fpTable').classList.add('hidden');
+    toast((r && r.error) || '核查失败');
+    return;
+  }
   const results = r.results || [];
-  $('leakSummary').innerHTML = `质检通过但带异常标签的图：<strong>${results.length}</strong> 张`;
-  const tbody = $('leakTable').querySelector('tbody');
+  $('fpSummary').innerHTML = `含禁止标签且已质检通过的图：<strong>${results.length}</strong> 张`;
+  const tbody = $('fpTable').querySelector('tbody');
   tbody.innerHTML = '';
-  $('leakTable').classList.toggle('hidden', results.length === 0);
+  $('fpTable').classList.toggle('hidden', results.length === 0);
   results.forEach(r => {
     const tr = document.createElement('tr');
     tr.className = 'clickable';
@@ -527,10 +547,7 @@ function exportQueryCsv() {
   if (!state.queryResults.length) return toast('没有可导出的结果');
   const rows = [['图片', '框坐标', '状态', '质检员']];
   state.queryResults.forEach(r => {
-    const boxes = (r.boxes && r.boxes.length)
-      ? r.boxes.map(b => `${b.x},${b.y},${b.w},${b.h}`).join(' | ')
-      : `${r.box_count != null ? r.box_count : r.boxes.length} 框`;
-    rows.push([r.image_id, boxes, statusText(r.qc_status), r.qc_owner || '']);
+    rows.push([r.image_id, boxesText(r), statusText(r.qc_status), r.qc_owner || '']);
   });
   const csv = '\uFEFF' + rows.map(row => row.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
@@ -567,7 +584,7 @@ $('querySelectAll').onchange = e => {
 };
 $('batchRejectBtn').onclick = () => batchQc('#queryTable', 'reject', () => { if (state.queryResults.length) doQuery(); });
 $('batchPassBtn').onclick = () => batchQc('#queryTable', 'pass', () => { if (state.queryResults.length) doQuery(); });
-$('leakBtn').onclick = doLeak;
+$('fpBtn').onclick = doFalsePass;
 $('exportBtn').onclick = doExport;
 $('fixBtn').onclick = doFix;
 $('previewClose').onclick = closePreview;

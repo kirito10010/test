@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.2.1"   # 发布版自更新用：当前版本号
+VERSION = "1.2.2"   # 发布版自更新用：当前版本号
 UPDATE_URL = "https://raw.githubusercontent.com/kirito10010/test/main/version.json"
 
 # ---------- 会话状态 ----------
@@ -508,17 +508,29 @@ def clear_overrides_cache():
         _OVERRIDES_CACHE.clear()
 
 
-def _status_and_owner_maps(pid):
-    imgs = get_images(pid)
-    status_map = {}
-    for im in imgs.get("images", []):
-        status_map[_base_name(im.get("image_id", ""))] = im.get("qc_status")
-    owner_map = build_qc_owner_map(pid)
-    return status_map, owner_map
+def _image_info_map(pid):
+    """image_id -> {annotated, box_count, qc_status, pre_annotated}（来自 /images 快照）
+
+    annotated=False 即「未作业」（作业员还没做过）；这类图的 box_count 是模型预标注框数，
+    qc_status 为 null。
+    """
+    info = {}
+    for im in get_images(pid).get("images", []):
+        iid = im.get("image_id")
+        if not iid:
+            continue
+        info[iid] = {
+            "annotated": bool(im.get("annotated")),
+            "box_count": im.get("box_count") or 0,
+            "qc_status": im.get("qc_status") or "",
+            "pre_annotated": bool(im.get("pre_annotated")),
+        }
+    return info
 
 
 def query_images(pid, cat_names, sort=None, passed_minutes=None):
-    """按一个或多个分类名查命中图；cat_names 为空时返回全部已标注图
+    """按一个或多个分类名查命中图；cat_names 为空时返回全部图片
+    （人工已标注的取自导出，未作业的取自 /images 并记 qc_status="unannotated"）
     passed_minutes>0 时，只返回该时间窗内新通过、且当前仍为 passed 的图，按通过时间倒序"""
     proj = get_project(pid)
     if not proj:
@@ -534,10 +546,13 @@ def query_images(pid, cat_names, sort=None, passed_minutes=None):
     _PROGRESS["total"] = 0
     _PROGRESS["done"] = 0
     labels = get_export_labels(pid, force=force_export)
-    status_map, owner_map = _status_and_owner_maps(pid)
+    img_info = _image_info_map(pid)
+    owner_map = build_qc_owner_map(pid)
     results = []
+    seen_bases = set()
     for item in labels.get("labels", []):
         pic = item.get("pic_id", "")
+        base = _base_name(pic)
         if idxs:
             boxes = []
             for b in item.get("bboxes", []):
@@ -549,18 +564,34 @@ def query_images(pid, cat_names, sort=None, passed_minutes=None):
         else:
             boxes = []
             box_count = len(item.get("bboxes", []))
-        base = _base_name(pic)
+        info = img_info.get(_image_id(pic)) or {}
         results.append({
             "image_id": _image_id(pic),
             "boxes": boxes,
             "box_count": box_count,
-            "qc_status": status_map.get(base, "?"),
+            "qc_status": info.get("qc_status") or "?",
             "qc_owner": owner_map.get(base, ""),
         })
+        seen_bases.add(base)
+    if not idxs:
+        # 未作业图：只在「不选标签」时补进来——未作业图没有人工标注，命中不了任何标签
+        for iid, info in img_info.items():
+            if info["annotated"] or _base_name(iid) in seen_bases:
+                continue
+            results.append({
+                "image_id": iid,
+                "boxes": [],
+                "box_count": info["box_count"],
+                "qc_status": "unannotated",
+                "qc_owner": owner_map.get(_base_name(iid), ""),
+                "pre_annotated": info["pre_annotated"],
+            })
+    # 未作业图没有 reviewed_at，也不可能是 passed：排序/时间窗只对有人工标注的行拉实时状态
+    annotated_ids = [r["image_id"] for r in results if r["qc_status"] != "unannotated"]
     if passed_minutes:
         # 通过时间过滤：用实时 annotation 判断「N 分钟内通过且当前仍 passed」
         cutoff = _fmt_ts(time.time() - passed_minutes * 60)
-        ann = fetch_annotations(pid, [r["image_id"] for r in results])
+        ann = fetch_annotations(pid, annotated_ids)
         filtered = []
         for r in results:
             a = ann.get(r["image_id"], {})
@@ -572,18 +603,30 @@ def query_images(pid, cat_names, sort=None, passed_minutes=None):
         return filtered
     if sort == "reviewed_desc":
         # 用实时 annotation 的 reviewed_at + qc_status，避免 /images 快照延迟
-        ann = fetch_annotations(pid, [r["image_id"] for r in results])
+        ann = fetch_annotations(pid, annotated_ids)
         for r in results:
-            a = ann.get(r["image_id"], {})
+            a = ann.get(r["image_id"])
+            if not a:
+                continue
             r["qc_status"] = a.get("qc_status") or r.get("qc_status")
             r["reviewed_at"] = a.get("reviewed_at") or ""
-        # 新→旧；空时间（待质检）排最后
-        results.sort(key=lambda r: r["reviewed_at"], reverse=True)
+        # 新→旧；空时间（未作业/待质检）排最后
+        results.sort(key=lambda r: r.get("reviewed_at") or "", reverse=True)
     return results
 
 
-def leak_images(pid, cat_names):
-    """漏标：passed 但仍带这些标签的图"""
+def false_pass_images(pid, cat_names):
+    """误通过：已质检通过、但仍带这些（禁止出现的）标签的图
+
+    标签是手填的，写错就必须明确报错——否则空命中会被当成「查全部」，
+    把「所有已通过的图」当成本次核查结果（假阳性）。
+    """
+    proj = get_project(pid)
+    if not proj:
+        raise RuntimeError("项目不存在：" + pid)
+    unknown = [c for c in cat_names if category_to_export_idx(proj, c) is None]
+    if unknown:
+        raise RuntimeError("标签不存在：" + "、".join(unknown) + "（本项目分类：" + "、".join(proj.get("categories") or []) + "）")
     return [r for r in query_images(pid, cat_names) if r["qc_status"] == "passed"]
 
 
@@ -1319,12 +1362,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 except RuntimeError as e:
                     return self._send_json({"ok": False, "error": str(e)}, 400)
 
-            # /api/projects/{id}/leak?cats=a,b
-            m = re.match(r"^/api/projects/([^/]+)/leak$", path)
+            # /api/projects/{id}/false_pass?cats=a,b
+            m = re.match(r"^/api/projects/([^/]+)/false_pass$", path)
             if m and method == "GET":
                 cats = [c for c in (qs.get("cats", [""])[0]).split(",") if c] if qs.get("cats") else []
                 try:
-                    return self._send_json({"ok": True, "results": leak_images(m.group(1), cats)})
+                    return self._send_json({"ok": True, "results": false_pass_images(m.group(1), cats)})
                 except RuntimeError as e:
                     return self._send_json({"ok": False, "error": str(e)}, 400)
 

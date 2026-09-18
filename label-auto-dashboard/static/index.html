@@ -18,7 +18,7 @@
 
   <nav class="tabs" id="tabs">
     <button data-tab="query" class="active">标签巡检</button>
-    <button data-tab="leak">漏标告警</button>
+    <button data-tab="falsePass">误通过核查</button>
     <button data-tab="monitor">质检看板</button>
     <button data-tab="dist">标签分布</button>
     <button data-tab="search">图片搜索</button>
@@ -47,6 +47,7 @@
         <label>状态：</label>
         <select id="queryStatus">
           <option value="">全部</option>
+          <option value="unannotated">未作业</option>
           <option value="passed">已通过</option>
           <option value="pending">待质检</option>
           <option value="rejected">已打回</option>
@@ -82,16 +83,16 @@
       </div>
     </section>
 
-    <!-- 漏标告警 -->
-    <section id="tab-leak" class="tab-panel hidden">
+    <!-- 误通过核查 -->
+    <section id="tab-falsePass" class="tab-panel hidden">
       <div class="toolbar">
-        <label>异常标签（逗号分隔）：</label>
-        <input id="leakCats" value="前挡玻璃遮挡" placeholder="前挡玻璃遮挡,车辆遮挡">
-        <button id="leakBtn" class="btn primary">扫描漏标</button>
+        <label>禁止出现的标签（逗号分隔）：</label>
+        <input id="fpCats" value="前挡玻璃遮挡" placeholder="前挡玻璃遮挡,车辆遮挡">
+        <button id="fpBtn" class="btn primary">开始核查</button>
       </div>
-      <div class="summary" id="leakSummary"></div>
+      <div class="summary" id="fpSummary"></div>
       <div class="table-wrap">
-        <table id="leakTable" class="hidden">
+        <table id="fpTable" class="hidden">
           <thead>
             <tr><th>图片</th><th>框坐标 (x,y,w,h)</th><th>质检员</th></tr>
           </thead>
