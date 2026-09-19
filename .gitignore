@@ -1,0 +1,14 @@
+# ---- Python 字节码缓存 ----
+__pycache__/
+*.py[cod]
+
+# ---- PyInstaller 打包中间产物（每次打包都全量变化，不进仓库）----
+build/
+
+# ---- 程序运行时产生的更新器临时文件 ----
+*.exe.new
+*.update.bat
+*.updated
+
+# ---- Comate 规格/工作区文件（本地保留，不进仓库）----
+.comate/
