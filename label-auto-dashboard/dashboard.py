@@ -41,7 +41,13 @@ else:
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
 VERSION = "1.2.3"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
-UPDATE_URL = "https://raw.githubusercontent.com/kirito10010/test/main/version.json"
+# 自更新检查地址：按顺序尝试，第一条成功的即用。
+# 实测 raw.githubusercontent.com 在公司内网不可达（超时），所以把 GitHub 代理放第一位：
+# 既避免每次检查白等 15s 超时，也覆盖只通代理的网络；raw 作为兜底保留（其它网络可能更快）。
+UPDATE_URLS = [
+    "https://githubproxy.cc/https://raw.githubusercontent.com/kirito10010/test/main/version.json",
+    "https://raw.githubusercontent.com/kirito10010/test/main/version.json",
+]
 
 # ---------- 会话状态 ----------
 TOKEN = None
@@ -1845,16 +1851,16 @@ def _version_tuple(v):
 
 
 def _check_update():
-    if not UPDATE_URL:
-        return
-    try:
-        req = urllib.request.Request(UPDATE_URL, headers={"User-Agent": "label-auto-updater"})
-        d = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+    for url in UPDATE_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "label-auto-updater"})
+            d = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
+        except Exception:
+            continue        # 这条不通（超时/被挡/返回非 JSON）就试下一条
         new_ver = d.get("version") or ""
         if _version_tuple(new_ver) > _version_tuple(VERSION):
             _prompt_update(new_ver, d.get("notes") or "", d.get("download_url") or "")
-    except Exception:
-        pass  # 无网络/拉取失败静默跳过
+        return              # 已拿到版本信息（无论要不要更新），不再试其它地址
 
 
 def _prompt_update(version, notes, url):
