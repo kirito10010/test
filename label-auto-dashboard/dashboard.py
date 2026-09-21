@@ -520,7 +520,7 @@ def _fmt_ts(epoch):
 
 
 # annotation 状态缓存：qc_status/reviewed_at 短时间不变，缓存 30s。
-# _reconcile_rejected 会对所有 rejected 图逐张拉 annotation，若每次都现查，
+# _reconcile_overrides 会对所有本地纠正（pass/reject）逐张拉 annotation，若每次都现查，
 # 累计打回图多时会拖慢列表/计数请求（首屏与提交后卡顿的主因之一）。
 _ANNOTATION_CACHE = {}
 _ANNOTATION_CACHE_LOCK = threading.Lock()
@@ -556,33 +556,46 @@ def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
     return data
 
 
-def _reconcile_rejected(pid, overrides):
-    """对被本地判定为 rejected 的图，用 /annotation 实时状态复核。
+# 本地 verdict 纠正的复核宽限期：刚点通过/打回时不立刻用 /annotation 复核，
+# 否则上游状态还没落库，会把刚提交的纠正错误撤销（这正是当初只复核 reject 的原因）。
+OVERRIDE_VERIFY_GRACE = 60   # 秒
 
-    本地 override 记录的是「质检员打回」这一动作，但它没有失效机制；
-    作业员重新提交标注后平台真实 qc_status 已变回 pending。此处对 reject 图逐张实时复核：
-    - 仍 rejected：保留打回纠正
-    - 已 pending：撤销打回、标记为 pending，让该图立刻回到「待质检」
-    - 已 passed：撤销打回、标记为 passed
+
+def _reconcile_overrides(pid, overrides, ts_of):
+    """用 /annotation 的实时状态复核本地 verdict 纠正（**pass 与 reject 都要复核**）。
+
+    本地纠正记录的是「质检员点了通过/打回」这一动作，但它没有失效机制；作业员在**另一台机器**
+    重新提交标注后，平台真实 qc_status 已变回 pending，而纠正优先级高于 /images 快照，
+    所以不复核就会一直挂在「已通过」。此处逐张实时复核：
+    - pending  → 撤销纠正、标记 pending，让该图立刻回到「待质检」
+    - passed   → 标记 pass
+    - rejected → 标记 reject
+    - 拿不到状态 → 保留原纠正（不猜）
+
+    距提交不足 OVERRIDE_VERIFY_GRACE 的先跳过；复核是双向的，即使因上游滞后误撤销，
+    上游一致后下一次复核会改回来（自愈）。
     """
-    reject_ids = [k for k, v in overrides.items() if v == "reject"]
-    if not reject_ids:
+    now = time.time()
+    ids = [k for k, v in overrides.items()
+           if v in ("reject", "pass") and (now - (ts_of.get(k) or 0)) >= OVERRIDE_VERIFY_GRACE]
+    if not ids:
         return overrides
-    fresh = fetch_annotations(pid, reject_ids)
-    for k in reject_ids:
+    fresh = fetch_annotations(pid, ids)
+    for k in ids:
         st = (fresh.get(k) or {}).get("qc_status") or ""
         if st == "pending":
             overrides[k] = "pending"
         elif st == "passed":
             overrides[k] = "pass"
-        elif not st:
-            continue  # 拿不到状态，保留原 reject
-        # st == "rejected"：保留 reject
+        elif st == "rejected":
+            overrides[k] = "reject"
+        # 拿不到状态：保留原纠正
     return overrides
 
 
-# 复核结果缓存：_reconcile_rejected 会对所有 rejected 图逐张拉 annotation（最多 400 张），
-# 而它每次列表/计数请求都会跑一遍，是首屏与提交后「卡 2~3 秒」的主因。给它一个短 TTL 缓存。
+# 复核结果缓存：_reconcile_overrides 会对所有本地纠正（pass + reject）逐张拉 annotation
+# （最多约 400 张），而它每次列表/计数请求都会跑一遍，是首屏与提交后「卡 2~3 秒」的主因。
+# 给它一个短 TTL 缓存；宽限期与 _ANNOTATION_CACHE(30s) 也会挡掉一部分请求。
 _OVERRIDES_CACHE = {}
 _OVERRIDES_CACHE_LOCK = threading.Lock()
 
@@ -593,8 +606,8 @@ def get_overrides(pid, uid):
         ent = _OVERRIDES_CACHE.get(key)
         if ent and time.time() < ent[0]:
             return ent[1]
-    overrides = _recent_verdict_overrides(pid, uid)
-    overrides = _reconcile_rejected(pid, overrides)
+    overrides, ts_of = _recent_verdict_overrides(pid, uid)
+    overrides = _reconcile_overrides(pid, overrides, ts_of)
     with _OVERRIDES_CACHE_LOCK:
         _OVERRIDES_CACHE[key] = (time.time() + 15, overrides)
     return overrides
@@ -803,13 +816,20 @@ def qc_setup():
 
 
 def _recent_verdict_overrides(pid, uid):
-    """返回最近提交的 image_id -> verdict 映射（用于纠正 /images 的状态滞后，最新提交优先）"""
+    """返回 (image_id -> verdict, image_id -> 该纠正的提交时间)。
+
+    用于纠正 /images 的状态滞后，最新提交优先（_RECENT_GROUPS 新组在前，配合「首次出现即采用」）。
+    ts_of 供复核时判断宽限期，必须取「提供该纠正的最新组」的时间。
+    """
     overrides = {}
+    ts_of = {}
     for g in _RECENT_GROUPS:
         if g.get("pid") == pid and g.get("uid") == uid:
             for k, v in (g.get("verdicts") or {}).items():
-                overrides.setdefault(k, v)  # 最新的组优先
-    return overrides
+                if k not in overrides:          # 最新的组优先
+                    overrides[k] = v
+                    ts_of[k] = g.get("ts") or 0
+    return overrides, ts_of
 
 
 def _is_force(qs):
@@ -1031,13 +1051,16 @@ def anno_rejected_bases(pid):
     """返回当前被质检打回的图 base_name 集合（跨所有质检员，含实时复核撤销已重提交的）。
     用于作业平台的「被打回」页，弥补 /images 快照滞后导致打回图不显示的问题。"""
     overrides = {}
+    ts_of = {}
     for g in _RECENT_GROUPS:
         if g.get("pid") == pid:
             for k, v in (g.get("verdicts") or {}).items():
-                overrides.setdefault(k, v)   # 最新组优先
+                if k not in overrides:      # 最新组优先
+                    overrides[k] = v
+                    ts_of[k] = g.get("ts") or 0
     if not overrides:
         return set()
-    overrides = _reconcile_rejected(pid, overrides)
+    overrides = _reconcile_overrides(pid, overrides, ts_of)
     return {_base_name(k) for k, v in overrides.items() if v == "reject"}
 
 
@@ -1654,7 +1677,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             else:
                 failed.append({"image_id": iid, "error": d.get("error") or ("HTTP %s" % s)})
         _clear_cache_keep_stable()
-        # 提交会改变这些图的 qc_status，清掉 annotation 缓存，避免 _reconcile_rejected 读到旧的 pending
+        # 提交会改变这些图的 qc_status，清掉 annotation 缓存，避免 _reconcile_overrides 读到旧的 pending
         with _ANNOTATION_CACHE_LOCK:
             for v in verdicts:
                 _ANNOTATION_CACHE.pop((pid, v.get("image_id")), None)
