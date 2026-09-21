@@ -1,5 +1,5 @@
 {
-  "version": "1.2.3",
+  "version": "1.2.4",
   "notes": "1) 质检/作业平台刷新一致性：徽标计数与列表永远同源，10 秒自动刷新会自愈，普通 F5 即可拿到最新（不再需要 Ctrl+F5）。\n2) 数据看板批量打回改为按每张图归属的质检员提交，质检平台立刻能看到。\n3) 项目列表只显示活跃项目（一周内创建的；一周~一个月之间未做完的），加载更快。\n4) 修复：质检「已通过」在作业员重新改框后不会回到「未质检」的问题。\n5) 补充内置账号：王哲。",
-  "download_url": "https://githubproxy.cc/https://github.com/kirito10010/test/releases/download/v1.2.3/label-auto-v2.exe"
+  "download_url": "https://githubproxy.cc/https://github.com/kirito10010/test/releases/download/v1.2.4/label-auto-v2.exe"
 }
