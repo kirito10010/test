@@ -310,12 +310,25 @@ async function batchQc(scope, verdict, afterFn) {
   const act = verdict === 'pass' ? '通过' : '打回';
   if (!confirm(`确定将 ${ids.length} 张图${act}吗？`)) return;
   toast(`批量${act}中…`);
-  const r = await api('/api/projects/' + state.currentProjectId + '/batch_qc', {
-    method: 'POST', body: { image_ids: ids, verdict, reason: '' }
-  });
+  let r;
+  try {
+    r = await api('/api/projects/' + state.currentProjectId + '/batch_qc', {
+      method: 'POST', body: { image_ids: ids, verdict, reason: '' }
+    });
+  } catch (e) {
+    // 以前这里没有 try/catch，网络异常会静默无提示，看着像成功了
+    toast(`批量${act}失败：网络异常，请重试`);
+    return;
+  }
   if (!r || !r.ok) { toast((r && r.error) || `批量${act}失败`); return; }
   const failedN = (r.failed && r.failed.length) || 0;
-  toast(`${act}成功 ${r.succeeded} 张` + (failedN ? `，失败 ${failedN} 张` : ''));
+  const unassignedN = (r.unassigned && r.unassigned.length) || 0;
+  const noCredN = (r.no_cred && r.no_cred.length) || 0;
+  const warn = [];
+  if (failedN) warn.push(`失败 ${failedN} 张`);
+  if (unassignedN) warn.push(`${unassignedN} 张未分配质检员（质检平台看不到）`);
+  if (noCredN) warn.push(`${noCredN} 张的质检员未内置登录（平台归属可能不对）`);
+  toast(`${act}成功 ${r.succeeded} 张` + (warn.length ? `；${warn.join('；')}` : ''));
   if (afterFn) afterFn();
 }
 

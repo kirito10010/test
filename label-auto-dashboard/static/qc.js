@@ -27,6 +27,12 @@ function toast(msg) {
 
 async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
+  const isGet = !opts.method || opts.method === 'GET';
+  if (isGet) {
+    // 穿透缓存：浏览器侧不走缓存，URL 加时间戳让中间代理也拿不到旧响应
+    opts.cache = 'no-store';
+    path += (path.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+  }
   if (RELEASE) {
     const auth = getAuth();
     if (auth.token) opts.headers['Authorization'] = 'Bearer ' + auth.token;
@@ -72,6 +78,7 @@ let dirty = false;   // 当前图是否被编辑过（决定提交前是否需�
 const boxCache = {};   // imageId -> boxes，用于预加载标注框，避免「图快框慢」
 let imageToken = 0;    // 换图自增，丢弃过期的异步标注框结果，避免串图
 let listEls = [];      // 右侧列表 DOM 项缓存，避免每次通过/换图都全量 querySelectorAll 扫描
+let lastListSig = '';  // 上次列表签名，内容没变就只刷新徽标、不重建 DOM（10s 轮询用）
 
 function pid() { return state.projectId; }
 function uid() { return state.reviewerUid; }
@@ -118,17 +125,36 @@ function loadProjectShortcuts(pid_) {
   state.shortcuts = { catKeys, pass, reject, hideLabels };
 }
 
-/* ============ 每日质检量（内置账号才显示，10s 轮询） ============ */
-let _dailyTimer = null;
-function startDailyPoll() {
-  if (_dailyTimer) return;
-  _dailyTimer = setInterval(loadDailyStats, 10000);
+/* ============ 自动刷新：每日质检量 + 徽标计数 + 列表（10s） ============ */
+const POLL_MS = 10000;
+let _pollTimer = null;
+let _ticking = false;
+let dailyToken = 0;
+
+function startPoll() {
+  if (_pollTimer) return;
+  _pollTimer = setInterval(tick, POLL_MS);
 }
+
+/* 10s 心跳：数据坏了能自愈，不用手动刷新（页面不可见/正在提交时跳过） */
+async function tick() {
+  if (_ticking || document.hidden || submitting) return;
+  _ticking = true;
+  try {
+    loadDailyStats();
+    await refresh({ silent: true });
+  } finally {
+    _ticking = false;
+  }
+}
+
 function loadDailyStats() {
   const el = $('qcDailyStats');
   if (!el) return;
   if (!uid()) { el.innerHTML = ''; el.classList.add('hidden'); return; }
+  const myToken = ++dailyToken;
   api('/api/daily_stats?uid=' + encodeURIComponent(uid())).then((res) => {
+    if (myToken !== dailyToken) return;   // 已切质检员，丢弃过期结果
     if (res && res.ok && res.has_login) {
       el.innerHTML = formatDailyStats('质检量', res.qc_days);
       el.classList.toggle('hidden', !el.innerHTML);
@@ -164,7 +190,7 @@ async function init() {
   if (!s || !s.ok) { toast('加载项目失败'); return; }
   state.setup = s.projects || [];
   renderProjectSelect();
-  startDailyPoll();
+  startPoll();
 }
 
 function applyReleaseUI() {
@@ -200,8 +226,7 @@ function onProjectChange() {
   state.activeCategory = null;
   loadProjectShortcuts(state.projectId);
   renderCategoryButtons();
-  state.catFilter = [];
-  renderCatPicker();
+  resetFilters();   // 切项目必须清掉旧搜索/作业员/属性筛选，否则新列表会被旧条件过滤成空
   renderReviewerSelect(p ? p.reviewers : []);
   savePrefs();
   for (const k in boxCache) delete boxCache[k];   // 切项目清空标注框缓存
@@ -230,12 +255,10 @@ function renderReviewerSelect(reviewers) {
   } else {
     state.reviewerUid = null;
     listEls = [];
+    lastListSig = '';
     $('qcList').innerHTML = '<div class="empty">该项目暂无质检员</div>';
     clearViewer();
-    $('qcCounts').textContent = '';
-    $('badgePending').textContent = '';
-    $('badgePassed').textContent = '';
-    $('badgeRejected').textContent = '';
+    clearCounts();
   }
 }
 
@@ -245,9 +268,7 @@ function onReviewerChange() {
   clearViewer();
   savePrefs();
   loadDailyStats();
-  state.annotatorFilter = '';
-  state.catFilter = [];
-  updateCatPickerField();
+  resetFilters();
   loadAnnotatorOwners();
 
   if (!RELEASE) {
@@ -258,22 +279,24 @@ function onReviewerChange() {
     }
   }
   $('reviewerLogin').classList.add('hidden');
-  loadCounts();
-  refreshList(true);
+  refresh({ autoSelect: true, force: true });   // 切质检员即强制取最新
 }
 
 async function probeReviewerLogin() {
-  const res = await api('/api/qc/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
+  let res;
+  try {
+    res = await api('/api/qc/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
+  } catch (e) {
+    toast('加载失败（网络或服务异常）');
+    return;
+  }
   if (res && res.ok) {
     $('reviewerLogin').classList.add('hidden');
-    loadCounts();
-    refreshList(true);
+    refresh({ autoSelect: true, force: true });
   } else if (res && res.need_login) {
-    $('qcCounts').textContent = '';
-    $('badgePending').textContent = '';
-    $('badgePassed').textContent = '';
-    $('badgeRejected').textContent = '';
+    clearCounts();
     listEls = [];
+    lastListSig = '';
     $('qcList').innerHTML = '<div class="empty">该质检员需登录后查看</div>';
     openReviewerLogin(state.reviewers.find((x) => x.uid === state.reviewerUid));
   } else {
@@ -305,7 +328,7 @@ async function submitReviewerLogin() {
   }
   btn.disabled = false;
   if (r && r.ok) {
-    closeReviewerLogin(); toast('登录成功'); loadCounts(); refreshList(true);
+    closeReviewerLogin(); toast('登录成功'); refresh({ autoSelect: true, force: true });
   } else {
     toast((r && r.error) || '登录失败，请检查账号密码');
   }
@@ -395,6 +418,17 @@ function renderAnnotatorFilter() {
   else state.annotatorFilter = '';
 }
 
+/* ============ 筛选重置（切项目/切质检员时调用） ============ */
+function resetFilters() {
+  state.search = '';
+  state.annotatorFilter = '';
+  state.catFilter = [];
+  $('qcSearch').value = '';
+  renderAnnotatorFilter();   // 重建「全部作业员」下拉
+  renderCatPicker();         // 重建属性多选（清空勾选）
+  lastListSig = '';          // 强制重建列表
+}
+
 /* ============ 属性多选筛选 ============ */
 function renderCatPicker() {
   const dd = $('qcCatPickerDropdown');
@@ -410,7 +444,7 @@ function renderCatPicker() {
       if (cb.checked) state.catFilter.push(c);
       else state.catFilter = state.catFilter.filter((x) => x !== c);
       updateCatPickerField();
-      refreshList(false);   // 属性筛选走后端，重新拉列表
+      refresh({});   // 属性筛选走后端，重新拉列表（计数同源更新）
     };
     lab.appendChild(cb);
     const span = document.createElement('span');
@@ -450,51 +484,156 @@ function applyFilters(items) {
   });
 }
 
-/* ============ 右侧列表 ============ */
-let listToken = 0;   // 切页签/刷新时自增，丢弃过期的异步结果，避免竞态
+/* ============ 右侧列表 + 徽标计数（同一次请求，保证一致） ============ */
+let listToken = 0;    // 切页签/项目/刷新时自增，丢弃过期的异步结果，避免竞态
+let countsToken = 0;  // 单独的计数请求（登录探针、提交后）也需要令牌保护
+
+function listUrl(force) {
+  const q = ['pid=' + encodeURIComponent(pid()), 'uid=' + encodeURIComponent(uid())];
+  let base;
+  if (state.status === 'recent') {
+    base = '/api/qc/recent';
+  } else {
+    base = '/api/qc/assigned';
+    q.push('status=' + state.status, 'offset=0', 'limit=100000');
+    if (state.catFilter.length) q.push('cat=' + encodeURIComponent(state.catFilter.join(',')));
+  }
+  if (force) q.push('force=1');   // 打穿服务端内存缓存，取最新快照
+  return base + '?' + q.join('&');
+}
+
+function renderCounts(c) {
+  if (!c) return;
+  $('qcCounts').textContent = '共 ' + c.total + ' 条：作业中 ' + c.annotating;
+  $('badgePending').textContent = c.pending;
+  $('badgePassed').textContent = c.passed;
+  $('badgeRejected').textContent = c.rejected;
+}
+
+function clearCounts() {
+  $('qcCounts').textContent = '';
+  $('badgePending').textContent = '';
+  $('badgePassed').textContent = '';
+  $('badgeRejected').textContent = '';
+}
+
+function showListError(msg) {
+  listEls = [];
+  lastActiveId = null;
+  $('qcList').innerHTML = '<div class="empty">' + esc(msg || '加载失败') + '</div>';
+}
+
+/* 列表内容签名：状态/筛选/每项及其框数都没变 → 只刷徽标，不重建 DOM */
+function listSignature(items, boxCounts) {
+  return [state.status, state.catFilter.join(','), state.search, state.annotatorFilter,
+          items.map((id) => id + ':' + (boxCounts[id] || 0)).join(',')].join('|');
+}
+
+function rebuildList(items, boxCounts) {
+  const listEl = $('qcList');
+  listEl.innerHTML = '';
+  listEls = [];
+  lastActiveId = null;
+  if (!items.length) {
+    listEl.innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
+    return;
+  }
+  items.forEach((id) => makeListItem(id, (state.annOf[id] || {}).name, boxCounts[id]));
+}
+
+/* 正在改框 / 提交中 / 有弹窗：自动刷新不要打断用户 */
+function uiBusy() {
+  return dirty || submitting ||
+    !$('settings').classList.contains('hidden') ||
+    !$('reviewerLogin').classList.contains('hidden');
+}
+
+async function refresh(opts) {
+  opts = opts || {};
+  if (!pid() || !uid()) return [];
+  const myToken = ++listToken;
+  if (!opts.silent && !$('qcList').children.length) {
+    $('qcList').innerHTML = '<div class="empty">加载中…</div>';
+  }
+  let r;
+  try {
+    r = await api(listUrl(opts.force));
+  } catch (e) {
+    if (myToken === listToken && !opts.silent) showListError('网络异常，请点「刷新」重试');
+    return [];
+  }
+  if (myToken !== listToken) return [];   // 期间又切了页签/项目，丢弃过期结果
+  if (!r || !r.ok) {
+    if (!opts.silent) showListError((r && r.error) || '加载失败');
+    return [];
+  }
+  renderCounts(r.counts);   // 与列表同源，不会再出现「有计数、没数据」
+
+  const boxCounts = r.box_counts || {};
+  const rawItems = r.items || [];
+  const items = applyFilters(rawItems);
+  const sig = listSignature(items, boxCounts);
+  if (sig === lastListSig) {
+    if (opts.autoSelect && !state.currentImage && items.length) loadImage(items[0]);
+    return items;
+  }
+  if (opts.silent && uiBusy()) return items;   // 只更徽标，列表等用户空闲再重建
+
+  const prevScroll = $('qcList').scrollTop;
+  rebuildList(items, boxCounts);
+  lastListSig = sig;
+  $('qcList').scrollTop = prevScroll;   // 保留滚动位置，避免自动刷新把用户弹回顶部
+
+  // 当前图真的从后端列表里消失了（被别人通过/打回）才自动换图；
+  // 只是被搜索/筛选隐藏时不打扰用户
+  const currentGone = !!state.currentImage && rawItems.indexOf(state.currentImage) < 0;
+  if (opts.autoSelect) {
+    if (items.length) loadImage(items[0]);
+    else clearViewer();
+  } else if (items.indexOf(state.currentImage) >= 0) {
+    highlightListItem(state.currentImage);
+  } else if (opts.silent && currentGone && !dirty) {
+    if (items.length) loadImage(items[0]);
+    else clearViewer();
+  }
+  return items;
+}
+
+/* 单独的计数请求：登录探针与提交后使用（列表请求本身已带 counts） */
+async function loadCounts() {
+  if (!pid() || !uid()) return;
+  const myToken = ++countsToken;
+  let r;
+  try {
+    r = await api('/api/qc/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
+  } catch (e) {
+    return;
+  }
+  if (myToken !== countsToken) return;   // 已切项目/质检员，丢弃过期结果
+  if (!r || !r.ok) return;
+  renderCounts(r.counts);
+}
 
 function switchStatus(status) {
   state.status = status;
   document.querySelectorAll('.qc-tab').forEach((b) => b.classList.toggle('active', b.dataset.status === status));
-  refreshList(true);
+  lastListSig = '';
+  refresh({ autoSelect: true });
   updateActionButtons();
 }
 
-async function refreshList(autoSelect) {
-  const myToken = ++listToken;
-  const items = await loadList(myToken);
-  if (myToken !== listToken) return;   // 期间又切了页签/搜索，丢弃过期结果
-  if (autoSelect) {
-    if (items.length) loadImage(items[0]);
-    else clearViewer();
-  }
-}
-
-async function loadList(token) {
-  if (!pid() || !uid()) return [];
-  const listEl = $('qcList');
-  listEl.innerHTML = '<div class="empty">加载中…</div>';
-  let r;
-  if (state.status === 'recent') {
-    r = await api('/api/qc/recent?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
-  } else {
-    const catParam = state.catFilter.length ? '&cat=' + encodeURIComponent(state.catFilter.join(',')) : '';
-    r = await api('/api/qc/assigned?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()) + '&status=' + state.status + '&offset=0&limit=100000' + catParam);
-  }
-  if (token !== listToken) return [];   // 过期，不再渲染列表
-  listEl.innerHTML = '';
-  listEls = [];
-  lastActiveId = null;
-  let items = (r && r.items) || [];
-  items = applyFilters(items);
-  if (!items.length) {
-    listEl.innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
-  }
-  const boxCounts = (r && r.box_counts) || {};
-  items.forEach((id) => makeListItem(id, (state.annOf[id] || {}).name, boxCounts[id]));
-  // 不在这里批量预加载：初始只加载当前一张，避免 10+ 张图/框并发抢带宽，
-  // 拖慢首屏（LCP）。后续由 loadImage 滚动预加载紧接着的几张。
-  return items;
+/* 手动刷新：清掉标注框缓存 + 打穿服务端缓存，重新取最新 */
+async function onManualRefresh() {
+  if (!pid() || !uid()) return;
+  const btn = $('qcRefresh');
+  if (btn) btn.disabled = true;
+  toast('正在刷新…');
+  for (const k in boxCache) delete boxCache[k];
+  lastListSig = '';
+  await refresh({ force: true });
+  loadDailyStats();
+  if (btn) btn.disabled = false;
+  toast('已刷新');
 }
 
 function statusEmptyText() {
@@ -502,22 +641,6 @@ function statusEmptyText() {
   if (state.status === 'passed') return '暂无已通过图';
   if (state.status === 'rejected') return '暂无已打回图';
   return '暂无最近提交';
-}
-
-function loadCounts() {
-  $('qcCounts').textContent = '';
-  $('badgePending').textContent = '';
-  $('badgePassed').textContent = '';
-  $('badgeRejected').textContent = '';
-  if (!pid() || !uid()) return;
-  api('/api/qc/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid())).then((r) => {
-    if (!r || !r.ok) return;
-    const c = r.counts || {};
-    $('qcCounts').textContent = '共 ' + c.total + ' 条：作业中 ' + c.annotating;
-    $('badgePending').textContent = c.pending;
-    $('badgePassed').textContent = c.passed;
-    $('badgeRejected').textContent = c.rejected;
-  }).catch(() => {});
 }
 
 function makeListItem(id, annName, boxCount) {
@@ -846,8 +969,9 @@ function savePrefs() {
 /* ============ 事件绑定 ============ */
 $('qcProject').onchange = onProjectChange;
 $('qcReviewer').onchange = onReviewerChange;
-$('qcSearch').addEventListener('input', () => { state.search = $('qcSearch').value; refreshList(false); });
-$('qcAnnotatorFilter').onchange = () => { state.annotatorFilter = $('qcAnnotatorFilter').value; refreshList(false); };
+$('qcSearch').addEventListener('input', () => { state.search = $('qcSearch').value; refresh({}); });
+$('qcAnnotatorFilter').onchange = () => { state.annotatorFilter = $('qcAnnotatorFilter').value; refresh({}); };
+$('qcRefresh').onclick = onManualRefresh;
 $('qcCatPickerField').addEventListener('click', (e) => { e.stopPropagation(); toggleCatPicker(); });
 document.addEventListener('click', (e) => {
   if (!$('qcCatPicker').contains(e.target)) $('qcCatPickerDropdown').classList.add('hidden');
@@ -865,5 +989,15 @@ $('reviewerLoginCancel').onclick = closeReviewerLogin;
 $('reviewerLoginOk').onclick = submitReviewerLogin;
 $('reviewerLogin').onclick = (e) => { if (e.target === $('reviewerLogin')) closeReviewerLogin(); };
 document.querySelectorAll('.qc-tab').forEach((b) => { b.onclick = () => switchStatus(b.dataset.status); });
+
+/* 浏览器回退/前进恢复页面（bfcache）不会重新发请求，主动刷新一次 */
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted && pid() && uid()) {
+    lastListSig = '';
+    refresh({ silent: true, force: true });
+  }
+});
+/* 从别的标签页切回来时立即对齐一次 */
+document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
 
 init();

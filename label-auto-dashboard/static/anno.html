@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>作业平台</title>
 <link rel="icon" href="data:,">
-<link rel="stylesheet" href="/static/anno.css">
+<link rel="stylesheet" href="/static/anno.css?v=__VERSION__">
 </head>
 <body>
 <header class="anno-topbar">
@@ -19,6 +19,7 @@
   <div class="anno-spacer"></div>
   <div class="anno-counts" id="annoCounts"></div>
   <div class="anno-daily-stats" id="annoDailyStats"></div>
+  <button id="annoRefresh" class="btn">刷新</button>
   <button id="annoSettings" class="btn">设置</button>
   <a class="btn link-btn" id="linkDashboard" href="/">数据看板</a>
   <a class="btn link-btn" id="linkQc" href="/qc">质检平台</a>
@@ -87,7 +88,7 @@
 </div>
 
 <div id="toast" class="toast"></div>
-<script src="/static/viewer.js"></script>
-<script src="/static/anno.js"></script>
+<script src="/static/viewer.js?v=__VERSION__"></script>
+<script src="/static/anno.js?v=__VERSION__"></script>
 </body>
 </html>

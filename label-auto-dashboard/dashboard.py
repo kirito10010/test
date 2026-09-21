@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.2.2"   # 发布版自更新用：当前版本号
+VERSION = "1.2.3"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
 UPDATE_URL = "https://raw.githubusercontent.com/kirito10010/test/main/version.json"
 
 # ---------- 会话状态 ----------
@@ -66,6 +66,7 @@ _QC_LOGIN = {} if RELEASE_MODE else {
     "68f4d0965cb3": {"email": "v_lijin10@baidu.com", "password": "pw123456"},              # 李劲
     "d82165faee87": {"email": "v_liqingguang01@baidu.com", "password": "pw123456"},        # 李庆广
     "5ae7790e0793": {"email": "v_zhanghongchao01@baidu.com", "password": "huiyi4956.."},   # 张洪超（超子）
+    "6d3ed4e0042c": {"email": "v_wangzhe23@baidu.com", "password": "569127"},              # 王哲
     # 作业员
     "373ef86dae05": {"email": "v_guoyanan@baidu.com", "password": "123456"},               # 郭雅楠
     "7d716942e23d": {"email": "v_limin30@baidu.com", "password": "pw123456"},              # 李敏
@@ -112,11 +113,12 @@ def _current_uid():
 _UPSTREAM_SEM = threading.Semaphore(8)
 
 
-def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=None, token=None):
+def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=None, token=None, _retry=True):
     """把请求转发到 Label Auto，自动附带 Bearer token。返回 (status, headers, bytes)
 
     token 参数可指定用某个用户的 token（如质检员本人），缺省用全局 owner TOKEN。
     """
+    global _OWNER_TOKEN
     url = BASE + path
     if query:
         url += "?" + urllib.parse.urlencode(query)
@@ -134,13 +136,30 @@ def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=N
     with _UPSTREAM_SEM:
         try:
             resp = urllib.request.urlopen(req, timeout=180)
-            return resp.status, dict(resp.headers), resp.read()
+            status, h, raw = resp.status, dict(resp.headers), resp.read()
         except urllib.error.HTTPError as e:
-            return e.code, dict(e.headers), e.read()
+            status, h, raw = e.code, dict(e.headers), e.read()
         except Exception as e:
             return 502, {}, json.dumps(
                 {"ok": False, "error": "无法连接平台 %s：%s" % (BASE, e)},
                 ensure_ascii=False).encode("utf-8")
+    # token 过期自愈：清掉缓存凭据并重新登录，再重试一次，避免整站持续 401（只能重启服务）
+    if status == 401 and tok and _retry:
+        new_tok = None
+        if tok == _OWNER_TOKEN:
+            with _OWNER_TOKEN_LOCK:
+                _OWNER_TOKEN = None
+            new_tok = _get_owner_token()
+        else:
+            uids = [u for u, t in list(_QC_TOKENS.items()) if t == tok]
+            for u in uids:
+                _QC_TOKENS.pop(u, None)
+            if uids:
+                new_tok = _get_qc_token(uids[0])
+        if new_tok and new_tok != tok:
+            return upstream(method, path, query=query, body=body, raw_body=raw_body,
+                            extra_headers=extra_headers, token=new_tok, _retry=False)
+    return status, h, raw
 
 
 def json_bytes(obj):
@@ -233,12 +252,13 @@ def get_images(pid):
     return _fetch_images_sync(pid)
 
 
-def _fetch_images_sync(pid):
+def _fetch_images_sync(pid, force=False):
     key = "images_" + pid
     with _IMAGES_LOCK:
-        ent = _CACHE.get(key)
-        if ent is not None:
-            return ent[1]
+        if not force:                       # force=True 时跳过缓存，强制重拉最新快照
+            ent = _CACHE.get(key)
+            if ent is not None:
+                return ent[1]
         status, h, raw = upstream("GET", "/api/projects/%s/images" % pid,
                                   token=_get_owner_token())
         if status != 200:
@@ -270,6 +290,21 @@ def _refresh_images_async(pid):
                 _IMAGES_REFRESHING.discard(pid)
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def _force_refresh(pid):
+    """「刷新」时使用：同步重拉 /images 快照，并清掉该项目的 annotation/override 短缓存。
+
+    否则 F5 只会重发同样的请求、命中同样的内存缓存（180s/30s/15s），看起来「刷新没用」。
+    """
+    try:
+        _fetch_images_sync(pid, force=True)
+    except Exception:
+        pass   # 上游异常时退回旧缓存，不阻塞页面
+    clear_overrides_cache()
+    with _ANNOTATION_CACHE_LOCK:
+        for k in [k for k in _ANNOTATION_CACHE if k[0] == pid]:
+            _ANNOTATION_CACHE.pop(k, None)
 
 
 # 图片缓存：图片内容不可变（上游带 Cache-Control: immutable），缓存可大幅减少对上游的
@@ -328,12 +363,74 @@ def _get_owner_token():
     return None
 
 
-def get_monitoring():
-    data = cache_get("monitoring", ttl=60)
+# ---------- 项目活跃度过滤 ----------
+# 不给前端"全部项目"：项目多了拉取/解析都慢。规则（与使用者确认）：
+#   一周内创建的                         → 保留（不论质检是否完成）
+#   一周~一个月之间，质检还没做完         → 保留
+#   一周~一个月之间，质检已 100%          → 不要
+#   超过一个月                            → 一律不要
+PROJECT_KEEP_DAYS = 7     # 一周
+PROJECT_MAX_DAYS = 30     # 一个月
+
+
+def _parse_created_at(s):
+    """平台的 created_at 形如 '2026-09-20 15:29:08'；解析失败返回 None"""
+    try:
+        return time.mktime(time.strptime((s or "").strip()[:19], "%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        return None
+
+
+def keep_project(proj, now=None):
+    """该项目是否保留（见上方规则）。拿不到创建时间就保留，不靠猜测隐藏项目。"""
+    ts = _parse_created_at((proj or {}).get("created_at"))
+    if ts is None:
+        return True
+    age_days = ((now or time.time()) - ts) / 86400.0
+    if age_days > PROJECT_MAX_DAYS:
+        return False
+    if age_days <= PROJECT_KEEP_DAYS:
+        return True
+    # 必须用原始浮点比较：实测 qc_progress=99.99057 会显示成 100.0%，但它并未做完
+    return float(proj.get("qc_progress") or 0) < 100.0
+
+
+def get_monitoring(force=False):
+    """各项目统计（质检看板）。原始数据缓存 60s，读取时才按 keep_project 过滤，
+    这样时间窗随时间自然移动，不需要重启进程。"""
+    data = None if force else cache_get("monitoring", ttl=60)
     if data is None:
         status, h, raw = upstream("GET", "/api/admin/monitoring", token=_get_owner_token())
+        if status != 200:
+            raise RuntimeError("拉取项目统计失败 HTTP %s" % status)
         data = json.loads(raw.decode("utf-8"))
         cache_set("monitoring", data, ttl=60)
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        return data
+    out = dict(data)
+    out["projects"] = [p for p in data["projects"] if keep_project(p)]
+    return out
+
+
+def _active_project_ids():
+    """活跃项目 id 白名单。拿不到统计时返回 None（调用方视为"不过滤"，宁多不少）。"""
+    try:
+        data = get_monitoring()
+    except Exception:
+        return None
+    return {p.get("id") for p in (data.get("projects") or []) if p.get("id")}
+
+
+def _filter_projects_payload(raw):
+    """把 /api/projects 的原始响应按白名单过滤，返回 dict；解析失败返回 None（调用方原样透传）"""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    active = _active_project_ids()
+    if active is None or not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+        return data
+    data["projects"] = [p for p in data["projects"] if p.get("id") in active]
     return data
 
 
@@ -674,6 +771,7 @@ def qc_setup():
     发布版（release）按当前登录用户锁定（admin 保留切换）。"""
     proj_data = get_projects()
     names = build_uid_name_map()
+    active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
     if RELEASE_MODE:
         uid = _current_uid()
         role = (USER or {}).get("role") or ""
@@ -681,6 +779,8 @@ def qc_setup():
         out = []
         for p in proj_data.get("projects", []):
             pid = p.get("id")
+            if active is not None and pid not in active:
+                continue
             qc_assignees = p.get("qc_assignees") or []
             if not is_admin and uid not in qc_assignees and uid not in (p.get("qc_assignments") or {}):
                 continue
@@ -693,6 +793,8 @@ def qc_setup():
     out = []
     for p in proj_data.get("projects", []):
         pid = p.get("id")
+        if active is not None and pid not in active:
+            continue
         reviewers = [{"uid": uid, "name": names.get(uid, uid), "has_login": uid in _QC_LOGIN}
                      for uid in p.get("qc_assignees") or []]
         out.append({"id": pid, "name": p.get("name"), "reviewers": reviewers,
@@ -710,52 +812,73 @@ def _recent_verdict_overrides(pid, uid):
     return overrides
 
 
-def qc_counts(pid, uid):
-    """返回某质检员的实时数量：总数 / 作业中 / 待质检 / 已通过 / 已打回"""
+def _is_force(qs):
+    """查询串里的 force 标志（force=1/true/yes）：为真时打穿服务端内存缓存，强制取最新"""
+    return (qs.get("force", [""])[0] or "").lower() in ("1", "true", "yes")
+
+
+def _qc_status_resolver(pid, uid, force=False):
+    """返回 (files, resolve, box_map)。
+
+    counts 与 items 必须复用同一次调用的结果：/images 是 stale-while-revalidate 快照，
+    若两者各拉一次，后台刷新恰好落在这两次请求之间就会让计数与列表永久不一致。
+    """
+    if force:
+        _force_refresh(pid)
     proj = get_project(pid)
     if not proj:
         raise RuntimeError("项目不存在：" + pid)
     files = (proj.get("qc_assignments") or {}).get(uid) or []
-    imgs = get_images(pid)
     status_map = {}
-    for im in imgs.get("images", []):
+    box_map = {}
+    for im in get_images(pid).get("images", []):
         iid = im.get("image_id")
         if iid:
             status_map[iid] = im.get("qc_status")
+            box_map[iid] = im.get("box_count") or 0
     overrides = get_overrides(pid, uid)
     save_pending = _SAVE_PENDING.get(pid) or set()
+
+    def resolve(f):
+        if f in overrides:
+            v = overrides[f]
+            return "passed" if v == "pass" else ("pending" if v == "pending" else "rejected")
+        if f in save_pending:
+            return "pending"
+        return status_map.get(f)
+
+    return files, resolve, box_map
+
+
+def _qc_counts_of(files, resolve):
     total = len(files)
     pending = passed = rejected = 0
     for f in files:
-        st = status_map.get(f)
-        if f in overrides:
-            v = overrides[f]
-            if v == "pass":
-                st = "passed"
-            elif v == "pending":
-                st = "pending"
-            else:
-                st = "rejected"
-        elif f in save_pending:
-            st = "pending"
+        st = resolve(f)
         if st == "pending":
             pending += 1
         elif st == "passed":
             passed += 1
         elif st == "rejected":
             rejected += 1
-    annotating = total - pending - passed - rejected
-    return {"total": total, "annotating": annotating, "pending": pending,
-            "passed": passed, "rejected": rejected}
+    return {"total": total, "annotating": total - pending - passed - rejected,
+            "pending": pending, "passed": passed, "rejected": rejected}
 
 
-def qc_recent(pid, uid):
-    """返回该质检员最近提交的照片（按提交顺序，最新在前，最多 3 组=12 张）"""
+def qc_counts(pid, uid, force=False):
+    """返回某质检员的实时数量：总数 / 作业中 / 待质检 / 已通过 / 已打回"""
+    files, resolve, _ = _qc_status_resolver(pid, uid, force)
+    return _qc_counts_of(files, resolve)
+
+
+def qc_recent(pid, uid, force=False):
+    """返回该质检员最近提交的照片（按提交顺序，最新在前，最多 3 组=12 张）+ 实时计数"""
     out = []
     for g in _RECENT_GROUPS:
         if g.get("pid") == pid and g.get("uid") == uid:
             out.extend(g.get("image_ids") or [])
-    return {"items": out[:12]}
+    files, resolve, _ = _qc_status_resolver(pid, uid, force)
+    return {"items": out[:12], "counts": _qc_counts_of(files, resolve)}
 
 
 def qc_save(pid, image_id, boxes):
@@ -781,44 +904,21 @@ def qc_save(pid, image_id, boxes):
     return {"ok": False, "error": d.get("error") or ("HTTP %s" % s)}
 
 
-def qc_assigned(pid, uid, status, offset, limit, cat_names=None):
-    """返回某质检员在指定 qc_status 下的图片列表（分页）；cat_names 非空时按属性过滤"""
-    proj = get_project(pid)
-    if not proj:
-        raise RuntimeError("项目不存在：" + pid)
-    files = (proj.get("qc_assignments") or {}).get(uid) or []
-    imgs = get_images(pid)
-    status_map = {}
-    box_map = {}
-    for im in imgs.get("images", []):
-        iid = im.get("image_id")
-        if iid:
-            status_map[iid] = im.get("qc_status")
-            box_map[iid] = im.get("box_count") or 0
-    overrides = get_overrides(pid, uid)
-    save_pending = _SAVE_PENDING.get(pid) or set()
+def qc_assigned(pid, uid, status, offset, limit, cat_names=None, force=False):
+    """返回某质检员在指定 qc_status 下的图片列表（分页）；cat_names 非空时按属性过滤。
+
+    同时返回 counts（与 items 同一快照、同一过滤范围），供前端一次请求同时渲染徽标与列表。
+    """
+    files, resolve, box_map = _qc_status_resolver(pid, uid, force)
     cat_bases = category_match_bases(pid, cat_names) if cat_names else None
-    matched = []
-    for f in files:
-        if cat_bases is not None and _base_name(f) not in cat_bases:
-            continue
-        st = status_map.get(f)
-        if f in overrides:
-            v = overrides[f]
-            if v == "pass":
-                st = "passed"
-            elif v == "pending":
-                st = "pending"
-            else:
-                st = "rejected"
-        elif f in save_pending:
-            st = "pending"
-        if st == status:
-            matched.append(f)
+    if cat_bases is not None:
+        files = [f for f in files if _base_name(f) in cat_bases]
+    counts = _qc_counts_of(files, resolve)
+    matched = [f for f in files if resolve(f) == status]
     total = len(matched)
     items = matched[offset:offset + limit]
     box_counts = {f: box_map.get(f, 0) for f in items}
-    return {"total": total, "items": items, "box_counts": box_counts}
+    return {"total": total, "items": items, "box_counts": box_counts, "counts": counts}
 
 
 def anno_setup():
@@ -826,6 +926,7 @@ def anno_setup():
     发布版（release）按当前登录用户锁定（admin 保留切换）。"""
     proj_data = get_projects()
     names = build_uid_name_map()
+    active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
     if RELEASE_MODE:
         uid = _current_uid()
         role = (USER or {}).get("role") or ""
@@ -833,6 +934,8 @@ def anno_setup():
         out = []
         for p in proj_data.get("projects", []):
             pid = p.get("id")
+            if active is not None and pid not in active:
+                continue
             assignees = p.get("assignees") or []
             if not is_admin and uid not in assignees and uid not in (p.get("assignments") or {}):
                 continue
@@ -845,6 +948,8 @@ def anno_setup():
     out = []
     for p in proj_data.get("projects", []):
         pid = p.get("id")
+        if active is not None and pid not in active:
+            continue
         annotators = [{"uid": uid, "name": names.get(uid, uid), "has_login": uid in _QC_LOGIN}
                       for uid in p.get("assignees") or []]
         out.append({"id": pid, "name": p.get("name"), "annotators": annotators,
@@ -936,84 +1041,75 @@ def anno_rejected_bases(pid):
     return {_base_name(k) for k, v in overrides.items() if v == "reject"}
 
 
-def anno_assigned(pid, uid, status, offset, limit):
-    """返回某作业员在指定作业状态下的图片列表（分页）。
-    status: 'unannotated'（未作业）| 'submitted'（已提交）| 'rejected'（被打回）
+def _anno_status_resolver(pid, uid, force=False):
+    """返回 (files, bucket, info)。bucket(f) -> 'unannotated' | 'submitted' | 'rejected'。
+
+    与质检侧同理：counts 与 items 必须复用同一次解析结果，否则 /images 快照的后台刷新
+    会让徽标与列表不一致。
     """
+    if force:
+        _force_refresh(pid)
     proj = get_project(pid)
     if not proj:
         raise RuntimeError("项目不存在：" + pid)
     files = (proj.get("assignments") or {}).get(uid) or []
-    imgs = get_images(pid)
     info = {}
-    for im in imgs.get("images", []):
+    for im in get_images(pid).get("images", []):
         iid = im.get("image_id")
         if iid:
             info[iid] = {"annotated": im.get("annotated"), "qc_status": im.get("qc_status"),
                          "box_count": im.get("box_count") or 0}
     save_pending = _SAVE_PENDING.get(pid) or set()
     rejected_bases = anno_rejected_bases(pid)
-    matched = []
-    for f in files:
-        d = info.get(f) or {}
-        annotated = d.get("annotated")
-        st = d.get("qc_status")
+
+    def bucket(f):
         if f in save_pending:
             # 本地刚保存过 → 回到 pending，不再算「未作业」
-            annotated = True
-            st = "pending"
-        elif _base_name(f) in rejected_bases:
+            return "submitted"
+        if _base_name(f) in rejected_bases:
             # 最近被质检打回（/images 快照滞后），立即按 rejected 显示
-            annotated = True
-            st = "rejected"
-        if status == "unannotated":
-            if not annotated and st != "rejected":
-                matched.append(f)
-        elif status == "submitted":
-            if annotated and st != "rejected":
-                matched.append(f)
-        elif status == "rejected":
-            if st == "rejected":
-                matched.append(f)
-    total = len(matched)
-    items = matched[offset:offset + limit]
-    box_counts = {f: (info.get(f) or {}).get("box_count", 0) for f in items}
-    return {"total": total, "items": items, "box_counts": box_counts}
+            return "rejected"
+        d = info.get(f) or {}
+        if d.get("qc_status") == "rejected":
+            return "rejected"
+        return "submitted" if d.get("annotated") else "unannotated"
+
+    return files, bucket, info
 
 
-def anno_counts(pid, uid):
-    """返回某作业员的数量：总数 / 未作业 / 已提交 / 被打回"""
-    proj = get_project(pid)
-    if not proj:
-        raise RuntimeError("项目不存在：" + pid)
-    files = (proj.get("assignments") or {}).get(uid) or []
-    imgs = get_images(pid)
-    info = {}
-    for im in imgs.get("images", []):
-        iid = im.get("image_id")
-        if iid:
-            info[iid] = {"annotated": im.get("annotated"), "qc_status": im.get("qc_status")}
-    save_pending = _SAVE_PENDING.get(pid) or set()
-    rejected_bases = anno_rejected_bases(pid)
+def _anno_counts_of(files, bucket):
     total = len(files)
     unannotated = submitted = rejected = 0
     for f in files:
-        d = info.get(f) or {}
-        annotated = d.get("annotated")
-        st = d.get("qc_status")
-        if f in save_pending:
-            annotated = True
-            st = "pending"
-        elif _base_name(f) in rejected_bases:
-            annotated = True
-            st = "rejected"
-        if st == "rejected":
+        b = bucket(f)
+        if b == "rejected":
             rejected += 1
-        elif annotated:
+        elif b == "submitted":
             submitted += 1
         else:
             unannotated += 1
     return {"total": total, "unannotated": unannotated, "submitted": submitted, "rejected": rejected}
+
+
+def anno_assigned(pid, uid, status, offset, limit, force=False):
+    """返回某作业员在指定作业状态下的图片列表（分页）。
+    status: 'unannotated'（未作业）| 'submitted'（已提交）| 'rejected'（被打回）
+
+    同时返回 counts（与 items 同一快照），供前端一次请求同时渲染徽标与列表。
+    """
+    files, bucket, info = _anno_status_resolver(pid, uid, force)
+    counts = _anno_counts_of(files, bucket)
+    matched = [f for f in files if bucket(f) == status]
+    total = len(matched)
+    items = matched[offset:offset + limit]
+    box_counts = {f: (info.get(f) or {}).get("box_count", 0) for f in items}
+    return {"total": total, "items": items, "box_counts": box_counts, "counts": counts}
+
+
+def anno_counts(pid, uid, force=False):
+    """返回某作业员的数量：总数 / 未作业 / 已提交 / 被打回"""
+    files, bucket, _ = _anno_status_resolver(pid, uid, force)
+    return _anno_counts_of(files, bucket)
 
 
 # ======================================================================
@@ -1150,13 +1246,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/api/projects" and method == "GET":
             s, h, raw = upstream("GET", "/api/projects", token=_get_owner_token())
-            return self._send(s, self._pick_headers(h), raw)
+            if s != 200:
+                return self._send(s, self._pick_headers(h), raw)
+            data = _filter_projects_payload(raw)
+            if data is None:   # 解析失败就原样透传，不破坏既有行为
+                return self._send(s, self._pick_headers(h), raw)
+            return self._send_json(data)
 
         if not RELEASE_MODE and path == "/api/monitoring" and method == "GET":
-            if qs.get("force"):
-                _CACHE.pop("monitoring", None)
-            s, h, raw = upstream("GET", "/api/admin/monitoring", token=_get_owner_token())
-            return self._send(s, self._pick_headers(h), raw)
+            try:
+                return self._send_json(get_monitoring(force=bool(qs.get("force"))))
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
 
         if not RELEASE_MODE and path == "/api/query_progress" and method == "GET":
             return self._send_json({"ok": True, "progress": _PROGRESS})
@@ -1224,7 +1325,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if gate:
                 return gate
             try:
-                return self._send_json({"ok": True, **anno_assigned(pid, uid, status, offset, limit)})
+                return self._send_json({"ok": True, **anno_assigned(pid, uid, status, offset, limit,
+                                                                   force=_is_force(qs))})
             except RuntimeError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 
@@ -1236,7 +1338,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if gate:
                 return gate
             try:
-                return self._send_json({"ok": True, "counts": anno_counts(pid, uid)})
+                return self._send_json({"ok": True, "counts": anno_counts(pid, uid, force=_is_force(qs))})
             except RuntimeError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 
@@ -1280,7 +1382,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if gate:
                 return gate
             try:
-                return self._send_json({"ok": True, **qc_assigned(pid, uid, status, offset, limit, cat_names)})
+                return self._send_json({"ok": True, **qc_assigned(pid, uid, status, offset, limit, cat_names,
+                                                                 force=_is_force(qs))})
             except RuntimeError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 
@@ -1292,7 +1395,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if gate:
                 return gate
             try:
-                return self._send_json({"ok": True, "counts": qc_counts(pid, uid)})
+                return self._send_json({"ok": True, "counts": qc_counts(pid, uid, force=_is_force(qs))})
             except RuntimeError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 
@@ -1303,7 +1406,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             gate = self._qc_gated(uid)
             if gate:
                 return gate
-            return self._send_json({"ok": True, **qc_recent(pid, uid)})
+            try:
+                return self._send_json({"ok": True, **qc_recent(pid, uid, force=_is_force(qs))})
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
 
         m = re.match(r"^/api/qc/submit$", path)
         if m and method == "POST":
@@ -1438,27 +1544,79 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if verdict not in ("reject", "pass"):
             return self._send_json({"ok": False, "error": "verdict 只能是 reject 或 pass"}, 400)
 
-        succeeded = 0
-        failed = []
+        # 与质检平台 /api/qc/submit 对齐：按每张图的「归属质检员」分别用其本人 token 提交。
+        # 否则平台不会把这条质检结果归属到该质检员名下，质检平台「已打回」永远拿不到它。
+        try:
+            proj = get_project(pid) or {}
+        except Exception:
+            proj = {}   # 拉不到项目就退化为整批按 owner 提交
+        owner_uid_of = {}
+        for qc_uid, flist in (proj.get("qc_assignments") or {}).items():
+            for f in flist:
+                owner_uid_of[_base_name(f)] = qc_uid
+
+        buckets = {}   # uid -> [image_id]；uid="" 表示未分配给任何质检员
         for img in image_ids:
-            s, h, raw2 = upstream("POST", "/api/projects/%s/qc" % pid,
-                                  body={"image_id": img, "verdict": verdict, "reason": reason})
-            try:
-                d = json.loads(raw2.decode("utf-8"))
-            except Exception:
-                d = {}
-            if s == 200 and d.get("ok"):
-                succeeded += 1
-            else:
-                failed.append({"image_id": img,
-                               "error": d.get("error") or ("HTTP %s" % s)})
-        # 写操作后清空缓存，保证下次查询是打回后的新状态
+            buckets.setdefault(owner_uid_of.get(_base_name(img), ""), []).append(img)
+
+        succeeded = 0
+        as_reviewer = 0   # 用质检员本人 token 成功
+        as_owner = 0      # 回退 owner token 成功
+        no_cred = []      # 归属质检员没有内置登录凭据 → 只能用 owner 提交，平台归属可能不对
+        failed = []
+        for uid, imgs in buckets.items():
+            tok = _get_qc_token(uid) if uid else None   # 拿不到则 upstream 回退全局 owner token
+            if uid and not tok:
+                no_cred.extend(imgs)
+            for img in imgs:
+                s, h, raw2 = upstream("POST", "/api/projects/%s/qc" % pid,
+                                      body={"image_id": img, "verdict": verdict, "reason": reason},
+                                      token=tok)
+                try:
+                    d = json.loads(raw2.decode("utf-8"))
+                except Exception:
+                    d = {}
+                if s == 200 and d.get("ok"):
+                    succeeded += 1
+                    if tok:
+                        as_reviewer += 1
+                    else:
+                        as_owner += 1
+                else:
+                    failed.append({"image_id": img,
+                                   "error": d.get("error") or ("HTTP %s" % s)})
+
+        # 写操作后清空缓存，并清掉复核缓存，否则 15s 内的旧结果会挡住刚写入的纠正
         _CACHE.clear()
+        clear_overrides_cache()
+
+        # 记录本地纠正（弥补 /images 快照滞后）：该质检员的「已打回」与作业平台的「被打回」立刻可见
+        failed_ids = {f["image_id"] for f in failed}
+        if succeeded:
+            for uid, imgs in buckets.items():
+                ok_ids = [i for i in imgs if i not in failed_ids]
+                if not ok_ids:
+                    continue
+                _RECENT_GROUPS.insert(0, {
+                    "ts": time.time(),
+                    "pid": pid,
+                    "uid": uid,
+                    "image_ids": ok_ids,
+                    "verdicts": {i: verdict for i in ok_ids},
+                })
+            _RECENT_GROUPS[:] = _RECENT_GROUPS[:100]
+
         return self._send_json({
             "ok": True,
             "total": len(image_ids),
             "succeeded": succeeded,
             "failed": failed,
+            "as_reviewer": as_reviewer,
+            "as_owner": as_owner,
+            # 未分配给任何质检员的图：已提交，但质检平台任何质检员页签都不会显示它们
+            "unassigned": [i for i in buckets.get("", []) if i not in failed_ids],
+            # 归属质检员未内置登录凭据的图：只能用 owner 提交，平台可能不把它算在该质检员名下
+            "no_cred": [i for i in no_cred if i not in failed_ids],
         })
 
     # ---- 质检平台批量提交（每张独立 verdict） ----
@@ -1610,8 +1768,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                  "jpeg": "image/jpeg", "svg": "image/svg+xml", "json": "application/json"}.get(ext, "application/octet-stream")
         with open(fp, "rb") as f:
             body = f.read()
+        if ext == "html":
+            # 静态资源带版本指纹（?v=__VERSION__），发版后 URL 变化，浏览器/代理不会再用旧 JS/CSS
+            body = body.replace(b"__VERSION__", VERSION.encode("utf-8"))
         return self._send(200, {"Content-Type": ctype,
-                                "Cache-Control": "no-cache, no-store, must-revalidate"}, body)
+                                "Cache-Control": "no-cache, no-store, must-revalidate",
+                                "Pragma": "no-cache", "Expires": "0"}, body)
 
     @staticmethod
     def _pick_headers(h):
@@ -1620,6 +1782,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             out["Content-Type"] = h["Content-Type"]
         if h.get("Content-Disposition"):
             out["Content-Disposition"] = h["Content-Disposition"]
+        out["Cache-Control"] = "no-store"   # 透传的动态数据一律不缓存，避免刷新拿到旧值
         return out
 
 

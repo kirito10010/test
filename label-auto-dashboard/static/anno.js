@@ -27,6 +27,12 @@ function toast(msg) {
 
 async function api(path, options) {
   const opts = Object.assign({ headers: {} }, options || {});
+  const isGet = !opts.method || opts.method === 'GET';
+  if (isGet) {
+    // 穿透缓存：浏览器侧不走缓存，URL 加时间戳让中间代理也拿不到旧响应
+    opts.cache = 'no-store';
+    path += (path.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+  }
   if (RELEASE) {
     const auth = getAuth();
     if (auth.token) opts.headers['Authorization'] = 'Bearer ' + auth.token;
@@ -68,6 +74,7 @@ const state = {
 let currentBoxes = [];
 let currentViewer = null;
 let imageToken = 0;   // 换图自增，丢弃过期的异步标注框结果，避免串图
+let lastListSig = ''; // 上次列表签名，内容没变就只刷新徽标、不重建 DOM（10s 轮询用）
 
 /* ============ 最近提交持久化（存浏览器 localStorage，按项目隔离） ============ */
 const RECENT_KEY = 'anno_recent_submits';
@@ -132,19 +139,36 @@ function loadProjectShortcuts(pid_) {
   state.shortcuts = { catKeys, submit, hideLabels };
 }
 
-/* ============ 每日标注量（内置账号才显示，10s 轮询） ============ */
-let _dailyTimer = null;
+/* ============ 自动刷新：每日标注量 + 徽标计数 + 列表（10s） ============ */
+const POLL_MS = 10000;
+let _pollTimer = null;
+let _ticking = false;
+let dailyToken = 0;
 
-function startDailyPoll() {
-  if (_dailyTimer) return;
-  _dailyTimer = setInterval(loadDailyStats, 10000);
+function startPoll() {
+  if (_pollTimer) return;
+  _pollTimer = setInterval(tick, POLL_MS);
+}
+
+/* 10s 心跳：数据坏了能自愈，不用手动刷新（页面不可见时跳过） */
+async function tick() {
+  if (_ticking || document.hidden) return;
+  _ticking = true;
+  try {
+    loadDailyStats();
+    await refresh({ silent: true });
+  } finally {
+    _ticking = false;
+  }
 }
 
 function loadDailyStats() {
   const el = $('annoDailyStats');
   if (!el) return;
   if (!uid()) { el.innerHTML = ''; el.classList.add('hidden'); return; }
+  const myToken = ++dailyToken;
   api('/api/daily_stats?uid=' + encodeURIComponent(uid())).then((res) => {
+    if (myToken !== dailyToken) return;   // 已切作业员，丢弃过期结果
     if (res && res.ok && res.has_login) {
       el.innerHTML = formatDailyStats('标注量', res.annotated_days);
       el.classList.toggle('hidden', !el.innerHTML);
@@ -202,6 +226,15 @@ function applyFilters(items) {
   });
 }
 
+/* ============ 筛选重置（切项目/切作业员时调用） ============ */
+function resetFilters() {
+  state.search = '';
+  state.qcFilter = '';
+  $('annoSearch').value = '';
+  renderQcFilter();          // 重建「全部质检员」下拉
+  lastListSig = '';          // 强制重建列表
+}
+
 /* ============ 初始化 ============ */
 async function init() {
   try {
@@ -219,7 +252,7 @@ async function init() {
   if (!s || !s.ok) { toast('加载项目失败'); return; }
   state.setup = s.projects || [];
   renderProjectSelect();
-  startDailyPoll();
+  startPoll();
 }
 
 function applyReleaseUI() {
@@ -256,6 +289,7 @@ function onProjectChange() {
   state.recentSubmits = loadProjectRecent(state.projectId);
   loadProjectShortcuts(state.projectId);
   renderCategoryButtons();
+  resetFilters();   // 切项目必须清掉旧搜索/质检员筛选，否则新列表会被旧条件过滤成空
   renderAnnotatorSelect(p ? p.annotators : []);
   savePrefs();
 }
@@ -282,7 +316,10 @@ function renderAnnotatorSelect(annotators) {
     onAnnotatorChange();
   } else {
     state.uid = null;
+    lastListSig = '';
     $('annoList').innerHTML = '<div class="empty">该项目暂无作业员</div>';
+    clearViewer();
+    clearCounts();
   }
 }
 
@@ -292,7 +329,7 @@ function onAnnotatorChange() {
   clearViewer();
   savePrefs();
   loadDailyStats();
-  state.qcFilter = '';
+  resetFilters();
   loadQcOwners();
   if (!RELEASE) {
     const a = state.annotators.find((x) => x.uid === state.uid);
@@ -302,18 +339,23 @@ function onAnnotatorChange() {
     }
   }
   $('annoLogin').classList.add('hidden');
-  loadCounts();
-  refreshList(true);
+  refresh({ autoSelect: true, force: true });   // 切作业员即强制取最新
 }
 
 /* ============ 登录门槛 ============ */
 async function probeLogin() {
-  const res = await api('/api/anno/assigned?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()) + '&status=' + state.status + '&offset=0&limit=1');
+  let res;
+  try {
+    res = await api('/api/anno/assigned?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()) + '&status=' + state.status + '&offset=0&limit=1');
+  } catch (e) {
+    toast('加载失败（网络或服务异常）');
+    return;
+  }
   if (res && res.ok) {
     $('annoLogin').classList.add('hidden');
-    loadCounts();
-    refreshList(true);
+    refresh({ autoSelect: true, force: true });
   } else if (res && res.need_login) {
+    lastListSig = '';
     $('annoList').innerHTML = '<div class="empty">该作业员需登录后查看</div>';
     openLogin(state.annotators.find((x) => x.uid === state.uid));
   }
@@ -339,7 +381,7 @@ async function submitLogin() {
   }
   btn.disabled = false;
   if (r && r.ok) {
-    closeLogin(); toast('登录成功'); loadCounts(); refreshList(true);
+    closeLogin(); toast('登录成功'); refresh({ autoSelect: true, force: true });
   } else {
     toast((r && r.error) || '登录失败，请检查账号密码');
   }
@@ -380,46 +422,149 @@ function setActiveCategory(cat) {
   }
 }
 
-/* ============ 右侧列表 ============ */
-function switchStatus(status) {
-  state.status = status;
-  document.querySelectorAll('.anno-tab').forEach((b) => b.classList.toggle('active', b.dataset.status === status));
-  refreshList(true);
+/* ============ 右侧列表 + 徽标计数（同一次请求，保证一致） ============ */
+let listToken = 0;    // 切页签/项目/刷新时自增，丢弃过期的异步结果，避免竞态
+let countsToken = 0;  // 单独的计数请求（登录探针、保存后）也需要令牌保护
+
+function listUrl(force) {
+  const q = ['pid=' + encodeURIComponent(pid()), 'uid=' + encodeURIComponent(uid()),
+             'status=' + state.status, 'offset=0', 'limit=100000'];
+  if (force) q.push('force=1');   // 打穿服务端内存缓存，取最新快照
+  return '/api/anno/assigned?' + q.join('&');
 }
 
-async function refreshList(autoSelect) {
-  const items = await loadList();
-  if (autoSelect) {
-    if (items.length) loadImage(items[0]);
-    else clearViewer();
-  }
+/* 已提交：原始顺序反转显示，本次会话刚提交的提到最前 */
+function orderItems(items) {
+  if (state.status !== 'submitted') return items;
+  const out = items.slice().reverse();
+  if (!state.recentSubmits.length) return out;
+  const recent = state.recentSubmits.filter((id) => out.indexOf(id) >= 0);
+  const rest = out.filter((id) => recent.indexOf(id) < 0);
+  return recent.concat(rest);
 }
 
-async function loadList() {
-  if (!pid() || !uid()) return [];
+function renderCounts(c) {
+  if (!c) return;
+  $('annoCounts').textContent = '共 ' + c.total + ' 条：已提交 ' + c.submitted;
+  $('badgeUnannotated').textContent = c.unannotated;
+  $('badgeSubmitted').textContent = c.submitted;
+  $('badgeRejected').textContent = c.rejected;
+}
+
+function clearCounts() {
+  $('annoCounts').textContent = '';
+  $('badgeUnannotated').textContent = '';
+  $('badgeSubmitted').textContent = '';
+  $('badgeRejected').textContent = '';
+}
+
+function showListError(msg) {
+  lastListSig = '';
+  $('annoList').innerHTML = '<div class="empty">' + esc(msg || '加载失败') + '</div>';
+}
+
+/* 列表内容签名：状态/筛选/每项及其框数都没变 → 只刷徽标，不重建 DOM */
+function listSignature(items, boxCounts) {
+  return [state.status, state.search, state.qcFilter, state.recentSubmits.slice(0, 20).join(','),
+          items.map((id) => id + ':' + (boxCounts[id] || 0)).join(',')].join('|');
+}
+
+function rebuildList(items, boxCounts) {
   const listEl = $('annoList');
-  listEl.innerHTML = '<div class="empty">加载中…</div>';
-  const r = await api('/api/anno/assigned?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()) + '&status=' + state.status + '&offset=0&limit=100000');
   listEl.innerHTML = '';
-  let items = (r && r.items) || [];
-  // 已提交：原始顺序反转显示，本次会话刚提交的提到最前
-  if (state.status === 'submitted') {
-    items = items.slice().reverse();
-    if (state.recentSubmits.length) {
-      const recent = state.recentSubmits.filter((id) => items.indexOf(id) >= 0);
-      const rest = items.filter((id) => recent.indexOf(id) < 0);
-      items = recent.concat(rest);
-    }
-  }
-  items = applyFilters(items);
   if (!items.length) {
     listEl.innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
+    return;
   }
-  const boxCounts = (r && r.box_counts) || {};
   items.forEach((id) => makeListItem(id, (state.qcOf[id] || {}).name, boxCounts[id]));
   // 预加载前几张图片，减少切换时闪黑
   items.slice(0, 4).forEach((id) => prefetchImage(id));
+}
+
+/* 有弹窗时自动刷新不要打断用户 */
+function uiBusy() {
+  return !$('annoSettingsBox').classList.contains('hidden') ||
+         !$('annoLogin').classList.contains('hidden');
+}
+
+async function refresh(opts) {
+  opts = opts || {};
+  if (!pid() || !uid()) return [];
+  const myToken = ++listToken;
+  if (!opts.silent && !$('annoList').children.length) {
+    $('annoList').innerHTML = '<div class="empty">加载中…</div>';
+  }
+  let r;
+  try {
+    r = await api(listUrl(opts.force));
+  } catch (e) {
+    if (myToken === listToken && !opts.silent) showListError('网络异常，请点「刷新」重试');
+    return [];
+  }
+  if (myToken !== listToken) return [];   // 期间又切了页签/项目，丢弃过期结果
+  if (!r || !r.ok) {
+    if (!opts.silent) showListError((r && r.error) || '加载失败');
+    return [];
+  }
+  renderCounts(r.counts);   // 与列表同源，不会再出现「有计数、没数据」
+
+  const boxCounts = r.box_counts || {};
+  const items = orderItems(applyFilters(r.items || []));
+  const sig = listSignature(items, boxCounts);
+  if (sig === lastListSig) {
+    if (opts.autoSelect && !state.currentImage && items.length) loadImage(items[0]);
+    return items;
+  }
+  if (opts.silent && uiBusy()) return items;   // 只更徽标，列表等用户空闲再重建
+
+  const prevScroll = $('annoList').scrollTop;
+  rebuildList(items, boxCounts);
+  lastListSig = sig;
+  $('annoList').scrollTop = prevScroll;   // 保留滚动位置
+
+  if (opts.autoSelect) {
+    if (items.length) loadImage(items[0]);
+    else clearViewer();
+  } else if (items.indexOf(state.currentImage) >= 0) {
+    highlightListItem(state.currentImage);
+  }
+  // 自动刷新不动当前图，避免丢掉正在画的框
   return items;
+}
+
+/* 单独的计数请求：登录探针与保存后使用（列表请求本身已带 counts） */
+async function loadCounts() {
+  if (!pid() || !uid()) return;
+  const myToken = ++countsToken;
+  let r;
+  try {
+    r = await api('/api/anno/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
+  } catch (e) {
+    return;
+  }
+  if (myToken !== countsToken) return;   // 已切项目/作业员，丢弃过期结果
+  if (!r || !r.ok) return;
+  renderCounts(r.counts);
+}
+
+function switchStatus(status) {
+  state.status = status;
+  document.querySelectorAll('.anno-tab').forEach((b) => b.classList.toggle('active', b.dataset.status === status));
+  lastListSig = '';
+  refresh({ autoSelect: true });
+}
+
+/* 手动刷新：打穿服务端缓存，重新取最新 */
+async function onManualRefresh() {
+  if (!pid() || !uid()) return;
+  const btn = $('annoRefresh');
+  if (btn) btn.disabled = true;
+  toast('正在刷新…');
+  lastListSig = '';
+  await refresh({ force: true });
+  loadDailyStats();
+  if (btn) btn.disabled = false;
+  toast('已刷新');
 }
 
 function statusEmptyText() {
@@ -428,21 +573,7 @@ function statusEmptyText() {
   return '暂无被打回图';
 }
 
-/* ============ 数量统计 ============ */
-async function loadCounts() {
-  $('annoCounts').textContent = '';
-  $('badgeUnannotated').textContent = '';
-  $('badgeSubmitted').textContent = '';
-  $('badgeRejected').textContent = '';
-  if (!pid() || !uid()) return;
-  const r = await api('/api/anno/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
-  if (!r || !r.ok) return;
-  const c = r.counts || {};
-  $('annoCounts').textContent = '共 ' + c.total + ' 条：已提交 ' + c.submitted;
-  $('badgeUnannotated').textContent = c.unannotated;
-  $('badgeSubmitted').textContent = c.submitted;
-  $('badgeRejected').textContent = c.rejected;
-}
+/* ============ 数量统计（见上方 loadCounts：单独请求，列表请求自带 counts） ============ */
 
 function makeListItem(id, qcName, boxCount) {
   const item = document.createElement('div');
@@ -556,7 +687,8 @@ async function save() {
 
   if (state.status === 'submitted') {
     // 已提交页签：该图保留，重新排序到顶部
-    await loadList();
+    lastListSig = '';
+    await refresh({});
     highlightListItem(imageId);
   } else {
     // 未作业/被打回：从列表移除，并自动加载下一张
@@ -698,8 +830,9 @@ function savePrefs() {
 /* ============ 事件绑定 ============ */
 $('annoProject').onchange = onProjectChange;
 $('annoReviewer').onchange = onAnnotatorChange;
-$('annoSearch').addEventListener('input', () => { state.search = $('annoSearch').value; refreshList(false); });
-$('annoQcFilter').onchange = () => { state.qcFilter = $('annoQcFilter').value; refreshList(false); };
+$('annoSearch').addEventListener('input', () => { state.search = $('annoSearch').value; refresh({}); });
+$('annoQcFilter').onchange = () => { state.qcFilter = $('annoQcFilter').value; refresh({}); };
+$('annoRefresh').onclick = onManualRefresh;
 $('annoSettings').onclick = openSettings;
 $('annoSettingsClose').onclick = closeSettings;
 $('annoSettingsSave').onclick = saveSettings;
@@ -709,5 +842,15 @@ $('annoLoginCancel').onclick = closeLogin;
 $('annoLoginOk').onclick = submitLogin;
 $('annoLogin').onclick = (e) => { if (e.target === $('annoLogin')) closeLogin(); };
 document.querySelectorAll('.anno-tab').forEach((b) => { b.onclick = () => switchStatus(b.dataset.status); });
+
+/* 浏览器回退/前进恢复页面（bfcache）不会重新发请求，主动刷新一次 */
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted && pid() && uid()) {
+    lastListSig = '';
+    refresh({ silent: true, force: true });
+  }
+});
+/* 从别的标签页切回来时立即对齐一次 */
+document.addEventListener('visibilitychange', () => { if (!document.hidden) tick(); });
 
 init();
