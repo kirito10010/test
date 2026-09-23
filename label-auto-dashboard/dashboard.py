@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.2.4"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
+VERSION = "1.2.5"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
 # 自更新检查地址：按顺序尝试，第一条成功的即用。
 # 实测 raw.githubusercontent.com 在公司内网不可达（超时），所以把 GitHub 代理放第一位：
 # 既避免每次检查白等 15s 超时，也覆盖只通代理的网络；raw 作为兜底保留（其它网络可能更快）。
@@ -202,13 +202,15 @@ def _clear_cache_keep_stable():
 # 数据获取
 # ======================================================================
 def get_projects(force=False):
-    data = None if force else cache_get("projects", ttl=1800)
+    # 缓存 60s（原来 1800s）：管理员在后台新建项目后，各平台最迟 1 分钟内就能拿到，
+    # 不必等半个小时。get_project() 每次列表请求都会用到它，即每个进程最多 60s 打一次上游。
+    data = None if force else cache_get("projects", ttl=60)
     if data is None:
         status, h, raw = upstream("GET", "/api/projects", token=_get_owner_token())
         if status != 200:
             raise RuntimeError("拉取项目列表失败 HTTP %s" % status)
         data = json.loads(raw.decode("utf-8"))
-        cache_set("projects", data, ttl=1800)
+        cache_set("projects", data, ttl=60)
     return data
 
 
@@ -2010,7 +2012,50 @@ def _maybe_show_updated_notice():
         pass
 
 
+# ---------- 单实例 ----------
+_SINGLE_INSTANCE_MUTEX = None   # 持有互斥体句柄，保证它活到进程结束
+
+
+def _single_instance_guard():
+    """首次启动返回 True；已有同名实例在跑返回 False。
+
+    互斥体名按构建区分，所以 dev 与 release 可以同时开，但同一个 exe 只能开一个。
+    非 Windows 或 API 不可用时一律返回 True —— 不因为环境问题把程序拦死。
+    """
+    global _SINGLE_INSTANCE_MUTEX
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        name = "Local\\label-auto-%s" % ("release" if RELEASE_MODE else "dev")
+        _SINGLE_INSTANCE_MUTEX = k32.CreateMutexW(None, False, name)
+        return k32.GetLastError() != 183   # ERROR_ALREADY_EXISTS
+    except Exception:
+        return True
+
+
+def _find_running_url():
+    """已在运行实例的页面地址；扫不到返回 None（只认 /api/config 返回 200 的端口）"""
+    for p in range(PORT_START, PORT_START + 30):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/api/config" % p, timeout=0.6) as r:
+                if r.status == 200:
+                    return "http://127.0.0.1:%d/qc" % p
+        except Exception:
+            continue
+    return None
+
+
 def main():
+    # 单实例：重复双击不再产生多个进程/多个托盘；已有实例就打开它的页面然后退出
+    if not _single_instance_guard():
+        url = _find_running_url()
+        if url:
+            webbrowser.open(url)
+        else:
+            _msgbox("已在运行", "程序已经在运行了（请看系统托盘）。", 0x40)  # MB_ICONINFORMATION
+        return
     _maybe_show_updated_notice()
     httpd = None
     port = PORT_START

@@ -56,6 +56,7 @@ function esc(s) {
 /* ============ 状态 ============ */
 const state = {
   setup: [],
+  setupIds: '',        // 项目 id 集合签名：没变就不重建下拉（静默刷新用）
   projectId: null,
   reviewerUid: null,
   reviewers: [],
@@ -137,14 +138,52 @@ function startPoll() {
 }
 
 /* 10s 心跳：数据坏了能自愈，不用手动刷新（页面不可见/正在提交时跳过） */
+let _tickCount = 0;
+const PROJECT_REFRESH_TICKS = 6;   // 10s × 6 = 60s 刷一次项目列表
+
 async function tick() {
   if (_ticking || document.hidden || submitting) return;
   _ticking = true;
   try {
     loadDailyStats();
     await refresh({ silent: true });
+    if (++_tickCount % PROJECT_REFRESH_TICKS === 0) await refreshProjects();
   } finally {
     _ticking = false;
+  }
+}
+
+/* 静默刷新项目列表：管理员后台新建的项目，不用退应用/刷页面也能出现在下拉里。
+   只在项目集合真的变了时重建下拉，并保留当前选中的项目，不打断正在做的事。 */
+async function refreshProjects() {
+  let s;
+  try {
+    s = await api('/api/qc/setup');
+  } catch (e) {
+    return;
+  }
+  if (!s || !s.ok) return;
+  const list = s.projects || [];
+  const ids = list.map((p) => p.id).join(',');
+  if (ids === state.setupIds) return;            // 集合没变 → 什么都不做
+  state.setupIds = ids;
+  state.setup = list;
+  const sel = $('qcProject');
+  const keep = state.projectId;
+  sel.innerHTML = '';
+  list.forEach((p) => {
+    const o = document.createElement('option');
+    o.value = p.id;
+    o.textContent = p.name;
+    sel.appendChild(o);
+  });
+  if (list.some((p) => p.id === keep)) {          // 当前项目还在 → 只多出新选项
+    sel.value = keep;
+    return;
+  }
+  if (list.length) {                              // 当前项目没了才切换
+    onProjectChange();
+    toast('项目列表已更新');
   }
 }
 
@@ -189,6 +228,7 @@ async function init() {
   const s = await api('/api/qc/setup');
   if (!s || !s.ok) { toast('加载项目失败'); return; }
   state.setup = s.projects || [];
+  state.setupIds = state.setup.map((p) => p.id).join(',');
   renderProjectSelect();
   startPoll();
 }

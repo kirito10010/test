@@ -4,6 +4,7 @@
 const state = {
   user: null,
   projects: [],
+  projectIds: '',        // 项目 id 集合签名：没变就不重建下拉（静默刷新用）
   currentProjectId: null,
   categories: [],
   colors: {},
@@ -43,22 +44,40 @@ async function api(path, options) {
 }
 
 /* ============ 项目 ============ */
-async function loadProjects() {
+async function loadProjects(opts) {
+  const silent = !!(opts && opts.silent);
   const r = await api('/api/projects');
-  if (!r || !r.ok) return toast((r && r.error) || '加载项目失败');
-  state.projects = r.projects || [];
+  if (!r || !r.ok) { if (!silent) toast((r && r.error) || '加载项目失败'); return; }
+  const list = r.projects || [];
+  const ids = list.map(p => p.id).join(',');
+  if (silent && ids === state.projectIds) return;   // 集合没变 → 什么都不做（不打断当前操作）
+  state.projectIds = ids;
+  state.projects = list;
   const sel = $('projectSel');
+  const keep = silent ? state.currentProjectId : null;
   sel.innerHTML = '';
-  state.projects.forEach(p => {
+  list.forEach(p => {
     const o = document.createElement('option');
     o.value = p.id;
     o.textContent = p.name;
     sel.appendChild(o);
   });
-  if (state.projects.length) {
-    state.currentProjectId = state.projects[0].id;
+  if (silent && list.some(p => p.id === keep)) {    // 当前项目还在 → 只多出新选项，不动现状
+    sel.value = keep;
+    return;
+  }
+  if (list.length) {
+    state.currentProjectId = list[0].id;
     await onProjectChange();
   }
+  if (silent) toast('项目列表已更新');
+}
+
+/* 静默刷新项目列表：后台新建的项目不用刷新页面也能出现（60s 一次） */
+let projectTimer = null;
+function startProjectAuto() {
+  if (projectTimer) return;
+  projectTimer = setInterval(() => loadProjects({ silent: true }), 60000);
 }
 
 async function onProjectChange() {
@@ -615,4 +634,5 @@ $('previewModal').onclick = e => { if (e.target === $('previewModal')) closePrev
   }
   $('projectBar').classList.remove('hidden');
   await loadProjects();
+  startProjectAuto();   // 每 60s 静默刷新项目列表（新项目不用刷页面就能出现）
 })();
