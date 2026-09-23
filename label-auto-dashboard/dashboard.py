@@ -202,15 +202,15 @@ def _clear_cache_keep_stable():
 # 数据获取
 # ======================================================================
 def get_projects(force=False):
-    # 缓存 60s（原来 1800s）：管理员在后台新建项目后，各平台最迟 1 分钟内就能拿到，
-    # 不必等半个小时。get_project() 每次列表请求都会用到它，即每个进程最多 60s 打一次上游。
-    data = None if force else cache_get("projects", ttl=60)
+    # 重接口，缓存 PROJECTS_TTL（默认 300s）——它不再负责"新鲜度"：monitoring 探针一旦发现
+    # 结构变化（新建项目/加图片/换质检员），get_projects_for_ui() 会立刻强拉一次。
+    data = None if force else cache_get("projects", ttl=PROJECTS_TTL)
     if data is None:
         status, h, raw = upstream("GET", "/api/projects", token=_get_owner_token())
         if status != 200:
             raise RuntimeError("拉取项目列表失败 HTTP %s" % status)
         data = json.loads(raw.decode("utf-8"))
-        cache_set("projects", data, ttl=60)
+        cache_set("projects", data, ttl=PROJECTS_TTL)
     return data
 
 
@@ -372,6 +372,14 @@ def _get_owner_token():
 
 
 # ---------- 项目活跃度过滤 ----------
+# 两个接口的"重量"差很多，缓存策略也分开：
+#   monitoring（轻，约 39KB）：当"变更探针"，拉得勤 → 新项目/结构变化能被及时看到
+#   projects  （重，含每个项目全部 assignments/qc_assignments，项目多时 MB 级）：只管"少拉几次"
+# 两者配合：探针发现结构签名变了 → 立刻强拉一次 projects，所以 projects 的 TTL 可以放长。
+MONITORING_TTL = 10      # 秒：探针的缓存时长（也是强拉 projects 的节流窗口）
+PROJECTS_TTL = 300       # 秒：重接口的缓存时长（结构变化时会提前刷，不必为新鲜度设短）
+PROJECTS_FORCE_MAX_TRIES = 3   # 同一处不一致最多强拉几次（上游迟迟不同步就放弃，等 TTL）
+
 # 不给前端"全部项目"：项目多了拉取/解析都慢。规则（与使用者确认）：
 #   一周内创建的                         → 保留（不论质检是否完成）
 #   一周~一个月之间，质检还没做完         → 保留
@@ -414,15 +422,15 @@ def keep_project(proj, now=None):
 
 
 def get_monitoring(force=False):
-    """各项目统计（质检看板）。原始数据缓存 60s，读取时才按 keep_project 过滤，
+    """各项目统计（质检看板）。原始数据缓存 MONITORING_TTL，读取时才按 keep_project 过滤，
     这样时间窗随时间自然移动，不需要重启进程。"""
-    data = None if force else cache_get("monitoring", ttl=60)
+    data = None if force else cache_get("monitoring", ttl=MONITORING_TTL)
     if data is None:
         status, h, raw = upstream("GET", "/api/admin/monitoring", token=_get_owner_token())
         if status != 200:
             raise RuntimeError("拉取项目统计失败 HTTP %s" % status)
         data = json.loads(raw.decode("utf-8"))
-        cache_set("monitoring", data, ttl=60)
+        cache_set("monitoring", data, ttl=MONITORING_TTL)
     if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
         return data
     out = dict(data)
@@ -439,13 +447,78 @@ def _active_project_ids():
     return {p.get("id") for p in (data.get("projects") or []) if p.get("id")}
 
 
-def _filter_projects_payload(raw):
-    """把 /api/projects 的原始响应按白名单过滤 + 按创建时间倒序；
-    解析失败返回 None（调用方原样透传）"""
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except Exception:
+def _monitoring_signature(data):
+    """从 monitoring 抽「结构签名」——只包含会改变"下拉能选到什么"的结构性信息：
+
+      项目 id 集合                  → 新建/删除项目
+      total_images                 → 项目里新增了图片（通常连带改 qc_assignments）
+      qc_assignees / assignees uid  → 质检员 / 作业员被加进或移出项目
+
+    **故意不含** progress / total_annotated / qc_progress：它们随标注实时变化，
+    纳入就会导致每次探针都"发现变化"→ 持续强拉上游。
+    """
+    if not isinstance(data, dict):
         return None
+    sig = []
+    for p in (data.get("projects") or []):
+        if not isinstance(p, dict) or not p.get("id"):
+            continue
+        qcs = tuple(sorted((a or {}).get("uid") or "" for a in (p.get("qc_assignees") or [])
+                           if isinstance(a, dict)))
+        anns = tuple(sorted((a or {}).get("uid") or "" for a in (p.get("assignees") or [])
+                            if isinstance(a, dict)))
+        sig.append((p["id"], p.get("total_images") or 0, qcs, anns))
+    return tuple(sorted(sig))
+
+
+_PROJECTS_SIG = None        # projects 缓存当前满足的 monitoring 结构签名
+_PROJECTS_TRY_SIG = None    # 最近一次尝试强拉时对应的签名（用于重置重试计数）
+_PROJECTS_FORCE_TS = 0.0    # 上次强拉时间（节流）
+_PROJECTS_FORCE_TRIES = 0   # 当前这处不一致已强拉几次
+
+
+def get_projects_for_ui():
+    """给下拉/看板用的项目列表：平时命中 PROJECTS_TTL 缓存（重接口少拉几次）；
+    一旦 monitoring 的结构签名与缓存时不一致，就立刻强拉一次 —— 这样后台新建项目、
+    给项目加图片、换质检员这些变化都不必等满 PROJECTS_TTL。
+    """
+    global _PROJECTS_SIG, _PROJECTS_TRY_SIG, _PROJECTS_FORCE_TS, _PROJECTS_FORCE_TRIES
+    data = get_projects()
+    try:
+        sig = _monitoring_signature(get_monitoring())
+    except Exception:
+        return data                      # 探针拿不到 → 不干预，沿用缓存
+    if sig is None:
+        return data
+    if _PROJECTS_SIG is None:            # 首次：只记录基线，不强拉
+        _PROJECTS_SIG = sig
+        return data
+    if sig == _PROJECTS_SIG:
+        _PROJECTS_FORCE_TRIES = 0        # 已一致 → 清零
+        return data
+    now = time.time()
+    if now - _PROJECTS_FORCE_TS < MONITORING_TTL:
+        return data                      # 节流
+    if sig != _PROJECTS_TRY_SIG:         # 换了一处不一致 → 重新计数
+        _PROJECTS_TRY_SIG = sig
+        _PROJECTS_FORCE_TRIES = 0
+    if _PROJECTS_FORCE_TRIES >= PROJECTS_FORCE_MAX_TRIES:
+        return data                      # 上游迟迟不同步 → 放弃，等 PROJECTS_TTL
+    _PROJECTS_FORCE_TS = now
+    _PROJECTS_FORCE_TRIES += 1
+    data = get_projects(force=True)
+    try:
+        payload_ids = {p.get("id") for p in (data.get("projects") or []) if isinstance(p, dict)}
+    except Exception:
+        payload_ids = set()
+    if {t[0] for t in sig} <= payload_ids:   # 上游已同步 → 基线更新、计数清零
+        _PROJECTS_SIG = sig
+        _PROJECTS_FORCE_TRIES = 0
+    return data
+
+
+def _filter_projects_payload(data):
+    """把 projects 响应按活跃白名单过滤 + 按创建时间倒序（就地改传入的 dict 并返回）"""
     if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
         return data
     active = _active_project_ids()
@@ -803,7 +876,7 @@ def search_images(pid, q):
 def qc_setup():
     """返回项目与各项目质检员（uid/name），供质检平台初始化。
     发布版（release）按当前登录用户锁定（admin 保留切换）。"""
-    proj_data = get_projects()
+    proj_data = get_projects_for_ui()
     names = build_uid_name_map()
     active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
     # 先按创建时间把源列表排好（输出的 dict 是精简过的、不带 created_at，不能事后再排）
@@ -967,7 +1040,7 @@ def qc_assigned(pid, uid, status, offset, limit, cat_names=None, force=False):
 def anno_setup():
     """返回项目与各项目作业员（uid/name/has_login），供作业平台初始化。
     发布版（release）按当前登录用户锁定（admin 保留切换）。"""
-    proj_data = get_projects()
+    proj_data = get_projects_for_ui()
     names = build_uid_name_map()
     active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
     # 先按创建时间把源列表排好（输出的 dict 是精简过的、不带 created_at，不能事后再排）
@@ -1293,13 +1366,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._send_json({"ok": True, "release": RELEASE_MODE})
 
         if path == "/api/projects" and method == "GET":
-            s, h, raw = upstream("GET", "/api/projects", token=_get_owner_token())
-            if s != 200:
-                return self._send(s, self._pick_headers(h), raw)
-            data = _filter_projects_payload(raw)
-            if data is None:   # 解析失败就原样透传，不破坏既有行为
-                return self._send(s, self._pick_headers(h), raw)
-            return self._send_json(data)
+            # 走缓存 + 探针强拉：看板下拉与各平台共用同一份项目列表，
+            # 避免前端每次轮询都去拉重的 /api/projects
+            try:
+                return self._send_json(_filter_projects_payload(get_projects_for_ui()))
+            except RuntimeError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
 
         if not RELEASE_MODE and path == "/api/monitoring" and method == "GET":
             try:

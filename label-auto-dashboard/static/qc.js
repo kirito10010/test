@@ -138,16 +138,13 @@ function startPoll() {
 }
 
 /* 10s 心跳：数据坏了能自愈，不用手动刷新（页面不可见/正在提交时跳过） */
-let _tickCount = 0;
-const PROJECT_REFRESH_TICKS = 6;   // 10s × 6 = 60s 刷一次项目列表
-
 async function tick() {
   if (_ticking || document.hidden || submitting) return;
   _ticking = true;
   try {
     loadDailyStats();
     await refresh({ silent: true });
-    if (++_tickCount % PROJECT_REFRESH_TICKS === 0) await refreshProjects();
+    await refreshProjects();   // 每次心跳都与探针同步：新建项目/结构变化最坏 ~20s 就能看到
   } finally {
     _ticking = false;
   }

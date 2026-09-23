@@ -73,11 +73,14 @@ async function loadProjects(opts) {
   if (silent) toast('项目列表已更新');
 }
 
-/* 静默刷新项目列表：后台新建的项目不用刷新页面也能出现（60s 一次） */
+/* 静默刷新项目列表：后台新建的项目不用刷新页面也能出现（10s 一次；后台标签页不刷） */
 let projectTimer = null;
 function startProjectAuto() {
   if (projectTimer) return;
-  projectTimer = setInterval(() => loadProjects({ silent: true }), 60000);
+  projectTimer = setInterval(() => {
+    if (document.hidden) return;
+    loadProjects({ silent: true });
+  }, 10000);
 }
 
 async function onProjectChange() {
