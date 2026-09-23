@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.2.5"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
+VERSION = "1.2.6"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
 # 自更新检查地址：按顺序尝试，第一条成功的即用。
 # 实测 raw.githubusercontent.com 在公司内网不可达（超时），所以把 GitHub 代理放第一位：
 # 既避免每次检查白等 15s 超时，也覆盖只通代理的网络；raw 作为兜底保留（其它网络可能更快）。
@@ -389,6 +389,16 @@ def _parse_created_at(s):
         return None
 
 
+def _project_sort_key(p):
+    """按创建时间排序用的 key；解析失败取 0，让这类项目排到最后"""
+    return _parse_created_at((p or {}).get("created_at")) or 0
+
+
+def _sort_projects_desc(projects):
+    """按创建时间倒序（新项目在前）。sorted 稳定，时间相同的保持原有相对顺序。"""
+    return sorted(projects, key=_project_sort_key, reverse=True)
+
+
 def keep_project(proj, now=None):
     """该项目是否保留（见上方规则）。拿不到创建时间就保留，不靠猜测隐藏项目。"""
     ts = _parse_created_at((proj or {}).get("created_at"))
@@ -430,15 +440,18 @@ def _active_project_ids():
 
 
 def _filter_projects_payload(raw):
-    """把 /api/projects 的原始响应按白名单过滤，返回 dict；解析失败返回 None（调用方原样透传）"""
+    """把 /api/projects 的原始响应按白名单过滤 + 按创建时间倒序；
+    解析失败返回 None（调用方原样透传）"""
     try:
         data = json.loads(raw.decode("utf-8"))
     except Exception:
         return None
-    active = _active_project_ids()
-    if active is None or not isinstance(data, dict) or not isinstance(data.get("projects"), list):
+    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
         return data
-    data["projects"] = [p for p in data["projects"] if p.get("id") in active]
+    active = _active_project_ids()
+    if active is not None:
+        data["projects"] = [p for p in data["projects"] if p.get("id") in active]
+    data["projects"] = _sort_projects_desc(data["projects"])   # 新项目排最前
     return data
 
 
@@ -793,12 +806,14 @@ def qc_setup():
     proj_data = get_projects()
     names = build_uid_name_map()
     active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
+    # 先按创建时间把源列表排好（输出的 dict 是精简过的、不带 created_at，不能事后再排）
+    projects = _sort_projects_desc(proj_data.get("projects", []))
     if RELEASE_MODE:
         uid = _current_uid()
         role = (USER or {}).get("role") or ""
         is_admin = (role == "admin")
         out = []
-        for p in proj_data.get("projects", []):
+        for p in projects:
             pid = p.get("id")
             if active is not None and pid not in active:
                 continue
@@ -812,7 +827,7 @@ def qc_setup():
                         "categories": p.get("categories") or []})
         return out
     out = []
-    for p in proj_data.get("projects", []):
+    for p in projects:
         pid = p.get("id")
         if active is not None and pid not in active:
             continue
@@ -955,12 +970,14 @@ def anno_setup():
     proj_data = get_projects()
     names = build_uid_name_map()
     active = _active_project_ids()   # None 表示拿不到统计 → 不过滤（保守）
+    # 先按创建时间把源列表排好（输出的 dict 是精简过的、不带 created_at，不能事后再排）
+    projects = _sort_projects_desc(proj_data.get("projects", []))
     if RELEASE_MODE:
         uid = _current_uid()
         role = (USER or {}).get("role") or ""
         is_admin = (role == "admin")
         out = []
-        for p in proj_data.get("projects", []):
+        for p in projects:
             pid = p.get("id")
             if active is not None and pid not in active:
                 continue
@@ -974,7 +991,7 @@ def anno_setup():
                         "categories": p.get("categories") or []})
         return out
     out = []
-    for p in proj_data.get("projects", []):
+    for p in projects:
         pid = p.get("id")
         if active is not None and pid not in active:
             continue
