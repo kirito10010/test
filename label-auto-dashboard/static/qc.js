@@ -858,11 +858,24 @@ function advanceAfter(id) {
   }
 }
 
+/* 「已通过」页签按“通过”：状态本来就是已通过，不必再提交一次，直接看下一张。
+   列表里这条保留（它的状态确实没变）。 */
+function advanceOnly() {
+  const id = state.currentImage;
+  if (!id) { toast('请先选择图片'); return; }
+  const idx = listEls.findIndex((el) => el.dataset.id === id);
+  const next = idx >= 0 ? listEls[idx + 1] : null;
+  if (next && next.dataset.id) loadImage(next.dataset.id);
+  else toast('已经是最后一张了');
+}
+
 function updateActionButtons() {
   const s = state.status;
   const hasImage = !!state.currentImage;
-  $('qcPass').classList.toggle('hidden', s !== 'pending');
-  $('qcReject').classList.toggle('hidden', s !== 'pending' && s !== 'recent');
+  // 「已通过」页签也给 通过/打回：通过 = 直接看下一张（状态本来就是已通过，不必再提交一次），
+  // 打回 = 真正打回
+  $('qcPass').classList.toggle('hidden', s !== 'pending' && s !== 'passed');
+  $('qcReject').classList.toggle('hidden', s !== 'pending' && s !== 'recent' && s !== 'passed');
   $('qcSave').classList.toggle('hidden', s !== 'rejected');
   $('qcPass').disabled = !hasImage;
   $('qcReject').disabled = !hasImage;
@@ -903,11 +916,14 @@ document.addEventListener('keydown', (e) => {
   if (!k) return;
   if (k === (state.shortcuts.pass || 'c')) {
     if (state.status === 'pending') { verdict('pass'); e.preventDefault(); }
+    else if (state.status === 'passed') { advanceOnly(); e.preventDefault(); }
     else if (state.status === 'rejected') { saveBoxes(); e.preventDefault(); }
     return;
   }
   if (k === (state.shortcuts.reject || 'r')) {
-    if (state.status === 'pending' || state.status === 'recent') { verdict('reject'); e.preventDefault(); }
+    if (state.status === 'pending' || state.status === 'recent' || state.status === 'passed') {
+      verdict('reject'); e.preventDefault();
+    }
     return;
   }
   if (k === (state.shortcuts.hideLabels || 'shift+3')) { toggleHideLabels(); e.preventDefault(); return; }
@@ -1013,7 +1029,7 @@ $('qcCatPickerField').addEventListener('click', (e) => { e.stopPropagation(); to
 document.addEventListener('click', (e) => {
   if (!$('qcCatPicker').contains(e.target)) $('qcCatPickerDropdown').classList.add('hidden');
 });
-$('qcPass').onclick = () => verdict('pass');
+$('qcPass').onclick = () => (state.status === 'passed' ? advanceOnly() : verdict('pass'));
 $('qcReject').onclick = () => verdict('reject');
 $('qcSave').onclick = saveBoxes;
 $('qcSettings').onclick = openSettings;
