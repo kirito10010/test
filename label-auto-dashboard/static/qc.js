@@ -68,6 +68,7 @@ const state = {
   shortcuts: { catKeys: {}, pass: 'c', reject: 'r', hideLabels: 'shift+3' },
   search: '',
   annotatorFilter: '',
+  boxFilter: 'all',    // 框数筛选：all / none(无框) / some(有框) / 精确数字 / '6+'
   catFilter: [],       // 已选属性（分类名数组），用于右侧列表按属性筛选
   annOf: {},
   anns: [],
@@ -460,7 +461,9 @@ function resetFilters() {
   state.search = '';
   state.annotatorFilter = '';
   state.catFilter = [];
+  state.boxFilter = 'all';
   $('qcSearch').value = '';
+  $('qcBoxFilter').value = 'all';
   renderAnnotatorFilter();   // 重建「全部作业员」下拉
   renderCatPicker();         // 重建属性多选（清空勾选）
   lastListSig = '';          // 强制重建列表
@@ -509,10 +512,23 @@ function toggleCatPicker() {
   $('qcCatPickerDropdown').classList.toggle('hidden');
 }
 
-function applyFilters(items) {
+/* 框数筛选：all=全部 none=无框 some=有框 '6+'=6 框及以上，其它=精确框数。
+   图不在 box_counts 里时按 0 框算（与列表显示的「0 框」一致）。 */
+function boxMatch(id, boxCounts) {
+  const f = state.boxFilter;
+  if (!f || f === 'all') return true;
+  const n = boxCounts[id] || 0;
+  if (f === 'none') return n === 0;
+  if (f === 'some') return n >= 1;
+  if (f === '6+') return n >= 6;
+  return n === Number(f);
+}
+
+function applyFilters(items, boxCounts) {
   const kw = state.search.trim().toLowerCase();
   return items.filter((id) => {
     if (kw && id.toLowerCase().indexOf(kw) < 0) return false;
+    if (!boxMatch(id, boxCounts || {})) return false;
     if (state.annotatorFilter) {
       const a = state.annOf[id];
       if (!a || a.uid !== state.annotatorFilter) return false;
@@ -562,7 +578,7 @@ function showListError(msg) {
 
 /* 列表内容签名：状态/筛选/每项及其框数都没变 → 只刷徽标，不重建 DOM */
 function listSignature(items, boxCounts) {
-  return [state.status, state.catFilter.join(','), state.search, state.annotatorFilter,
+  return [state.status, state.catFilter.join(','), state.search, state.annotatorFilter, state.boxFilter,
           items.map((id) => id + ':' + (boxCounts[id] || 0)).join(',')].join('|');
 }
 
@@ -608,7 +624,7 @@ async function refresh(opts) {
 
   const boxCounts = r.box_counts || {};
   const rawItems = r.items || [];
-  const items = applyFilters(rawItems);
+  const items = applyFilters(rawItems, boxCounts);
   const sig = listSignature(items, boxCounts);
   if (sig === lastListSig) {
     if (opts.autoSelect && !state.currentImage && items.length) loadImage(items[0]);
@@ -1024,6 +1040,7 @@ $('qcProject').onchange = onProjectChange;
 $('qcReviewer').onchange = onReviewerChange;
 $('qcSearch').addEventListener('input', () => { state.search = $('qcSearch').value; refresh({}); });
 $('qcAnnotatorFilter').onchange = () => { state.annotatorFilter = $('qcAnnotatorFilter').value; refresh({}); };
+$('qcBoxFilter').onchange = () => { state.boxFilter = $('qcBoxFilter').value; refresh({}); };
 $('qcRefresh').onclick = onManualRefresh;
 $('qcCatPickerField').addEventListener('click', (e) => { e.stopPropagation(); toggleCatPicker(); });
 document.addEventListener('click', (e) => {

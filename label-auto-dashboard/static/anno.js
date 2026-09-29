@@ -68,6 +68,7 @@ const state = {
   hideLabels: false,
   search: '',
   qcFilter: '',
+  boxFilter: 'all',    // 框数筛选：all / none(无框) / some(有框) / 精确数字 / '6+'
   qcOf: {},
   qcs: [],
 };
@@ -250,10 +251,24 @@ function renderQcFilter() {
   else state.qcFilter = '';
 }
 
-function applyFilters(items) {
+/* 框数筛选：all=全部 none=无框 some=有框 '6+'=6 框及以上，其它=精确框数。
+   图不在 box_counts 里时按 0 框算（与列表显示的「0 框」一致）。
+   注意「未作业」页签里的框数是模型预标注框数。 */
+function boxMatch(id, boxCounts) {
+  const f = state.boxFilter;
+  if (!f || f === 'all') return true;
+  const n = boxCounts[id] || 0;
+  if (f === 'none') return n === 0;
+  if (f === 'some') return n >= 1;
+  if (f === '6+') return n >= 6;
+  return n === Number(f);
+}
+
+function applyFilters(items, boxCounts) {
   const kw = state.search.trim().toLowerCase();
   return items.filter((id) => {
     if (kw && id.toLowerCase().indexOf(kw) < 0) return false;
+    if (!boxMatch(id, boxCounts || {})) return false;
     if (state.qcFilter) {
       const q = state.qcOf[id];
       if (!q || q.uid !== state.qcFilter) return false;
@@ -266,7 +281,9 @@ function applyFilters(items) {
 function resetFilters() {
   state.search = '';
   state.qcFilter = '';
+  state.boxFilter = 'all';
   $('annoSearch').value = '';
+  $('annoBoxFilter').value = 'all';
   renderQcFilter();          // 重建「全部质检员」下拉
   lastListSig = '';          // 强制重建列表
 }
@@ -502,7 +519,8 @@ function showListError(msg) {
 
 /* 列表内容签名：状态/筛选/每项及其框数都没变 → 只刷徽标，不重建 DOM */
 function listSignature(items, boxCounts) {
-  return [state.status, state.search, state.qcFilter, state.recentSubmits.slice(0, 20).join(','),
+  return [state.status, state.search, state.qcFilter, state.boxFilter,
+          state.recentSubmits.slice(0, 20).join(','),
           items.map((id) => id + ':' + (boxCounts[id] || 0)).join(',')].join('|');
 }
 
@@ -546,7 +564,7 @@ async function refresh(opts) {
   renderCounts(r.counts);   // 与列表同源，不会再出现「有计数、没数据」
 
   const boxCounts = r.box_counts || {};
-  const items = orderItems(applyFilters(r.items || []));
+  const items = orderItems(applyFilters(r.items || [], boxCounts));
   const sig = listSignature(items, boxCounts);
   if (sig === lastListSig) {
     if (opts.autoSelect && !state.currentImage && items.length) loadImage(items[0]);
@@ -869,6 +887,7 @@ $('annoProject').onchange = onProjectChange;
 $('annoReviewer').onchange = onAnnotatorChange;
 $('annoSearch').addEventListener('input', () => { state.search = $('annoSearch').value; refresh({}); });
 $('annoQcFilter').onchange = () => { state.qcFilter = $('annoQcFilter').value; refresh({}); };
+$('annoBoxFilter').onchange = () => { state.boxFilter = $('annoBoxFilter').value; refresh({}); };
 $('annoRefresh').onclick = onManualRefresh;
 $('annoSettings').onclick = openSettings;
 $('annoSettingsClose').onclick = closeSettings;

@@ -993,8 +993,10 @@ def qc_recent(pid, uid, force=False):
     for g in _RECENT_GROUPS:
         if g.get("pid") == pid and g.get("uid") == uid:
             out.extend(g.get("image_ids") or [])
-    files, resolve, _ = _qc_status_resolver(pid, uid, force)
-    return {"items": out[:12], "counts": _qc_counts_of(files, resolve)}
+    files, resolve, box_map = _qc_status_resolver(pid, uid, force)
+    items = out[:12]
+    box_counts = {f: box_map.get(f, 0) for f in items}
+    return {"items": items, "box_counts": box_counts, "counts": _qc_counts_of(files, resolve)}
 
 
 def qc_save(pid, image_id, boxes):
