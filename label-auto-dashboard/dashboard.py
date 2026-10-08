@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Label Auto 外接看板 —— 本地服务
-双击 启动看板.bat 或运行 `python dashboard.py` 即可。
+运行 `python dashboard.py` 即可。
 零依赖，仅用 Python 标准库。
 """
 import http.server
@@ -2171,9 +2171,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def _tray_image():
     if getattr(sys, "frozen", False):
-        p = os.path.join(getattr(sys, "_MEIPASS", HERE), "eternal-night-studio.ico")
+        p = os.path.join(getattr(sys, "_MEIPASS", HERE), "label-auto.ico")
     else:
-        p = os.path.join(HERE, "eternal-night-studio.ico")
+        p = os.path.join(HERE, "label-auto.ico")
     return Image.open(p)
 
 
