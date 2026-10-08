@@ -216,11 +216,14 @@ def _clear_cache_keep_stable():
     状态纠正在 qc_counts/qc_assigned 里由 _SAVE_PENDING + _recent_verdict_overrides
     完成，无需重拉全量 /images；若连 images 缓存也清掉，提交/保存后刷新会因
     重新拉全量图片列表而明显变慢。
+
+    也**不清** overrides 复核缓存：调用方用 note_overrides / note_overrides_saved
+    就地改那一条，否则下一次列表请求会对上百张本地纠正做全量 /annotation 复核，
+    把并发的「下一张图 / 下一次提交」堵上 2~3 秒。
     """
     for k in list(_CACHE.keys()):
         if not k.startswith("images_") and k != "projects":
             _cache_drop(k)
-    clear_overrides_cache()   # 提交/保存后旧的 rejected 复核结果已失效，清掉立即可见
 
 
 # ======================================================================
@@ -716,7 +719,7 @@ def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
 OVERRIDE_VERIFY_GRACE = 60   # 秒
 
 
-def _reconcile_overrides(pid, overrides, ts_of):
+def _reconcile_overrides(pid, overrides, ts_of, limit=None):
     """用 /annotation 的实时状态复核本地 verdict 纠正（**pass 与 reject 都要复核**）。
 
     本地纠正记录的是「质检员点了通过/打回」这一动作，但它没有失效机制；作业员在**另一台机器**
@@ -729,13 +732,19 @@ def _reconcile_overrides(pid, overrides, ts_of):
 
     距提交不足 OVERRIDE_VERIFY_GRACE 的先跳过；复核是双向的，即使因上游滞后误撤销，
     上游一致后下一次复核会改回来（自愈）。
+
+    limit 非空时只复核最新的一批（overrides 由 _recent_verdict_overrides 按「最新组优先」
+    插入，dict 顺序即新→旧）。这是为了让**冷缓存时的同步复核**有上界，不至于一次打出
+    上百个上游请求把 _UPSTREAM_SEM 占满、堵住并发的「下一张图 / 下一次提交」。
     """
     now = time.time()
     ids = [k for k, v in overrides.items()
            if v in ("reject", "pass") and (now - (ts_of.get(k) or 0)) >= OVERRIDE_VERIFY_GRACE]
     if not ids:
         return overrides
-    fresh = fetch_annotations(pid, ids)
+    if limit is not None and len(ids) > limit:
+        ids = ids[:limit]
+    fresh = fetch_annotations(pid, ids, max_workers=RECONCILE_WORKERS)
     for k in ids:
         st = (fresh.get(k) or {}).get("qc_status") or ""
         if st == "pending":
@@ -748,29 +757,105 @@ def _reconcile_overrides(pid, overrides, ts_of):
     return overrides
 
 
-# 复核结果缓存：_reconcile_overrides 会对所有本地纠正（pass + reject）逐张拉 annotation
-# （最多约 400 张），而它每次列表/计数请求都会跑一遍，是首屏与提交后「卡 2~3 秒」的主因。
-# 给它一个短 TTL 缓存；宽限期与 _ANNOTATION_CACHE(30s) 也会挡掉一部分请求。
-_OVERRIDES_CACHE = {}
+# 复核结果缓存：_reconcile_overrides 会对本地纠正（pass + reject）逐张拉 annotation
+# （最多约 100 张），而它每次列表/计数请求都会跑一遍，是首屏与提交后「卡 2~3 秒」的主因。
+# 所以：① 给结果一个短 TTL 缓存；② 过期也不阻塞请求，先用旧值、后台异步复核
+# （stale-while-revalidate，与 get_images 同一套写法）。
+OVERRIDES_TTL = 15          # 复核结果缓存（沿用原 15s）
+OVERRIDES_COLD_MAX = 12     # 冷启动时同步复核的上限：12 张 ≈ 0.3s，不阻塞
+RECONCILE_WORKERS = 4       # 复核并发上限：只占 _UPSTREAM_SEM(8) 的一半，留一半给交互请求
+
+_OVERRIDES_CACHE = {}          # (pid, uid) -> (expire_ts, overrides)
 _OVERRIDES_CACHE_LOCK = threading.Lock()
+_OVERRIDES_REFRESHING = set()  # 正在后台复核的 (pid, uid)，单飞
+
+
+def _compute_overrides(pid, uid, limit=None):
+    overrides, ts_of = _recent_verdict_overrides(pid, uid)
+    overrides = _reconcile_overrides(pid, overrides, ts_of, limit)
+    with _OVERRIDES_CACHE_LOCK:
+        _OVERRIDES_CACHE[(pid, uid)] = (time.time() + OVERRIDES_TTL, overrides)
+    return overrides
+
+
+def _refresh_overrides_async(pid, uid):
+    """后台复核，不阻塞请求；同一个 (pid, uid) 只跑一个线程。"""
+    key = (pid, uid)
+    with _OVERRIDES_CACHE_LOCK:
+        if key in _OVERRIDES_REFRESHING:
+            return
+        _OVERRIDES_REFRESHING.add(key)
+
+    def _run():
+        try:
+            _compute_overrides(pid, uid)
+        except Exception:
+            pass
+        finally:
+            with _OVERRIDES_CACHE_LOCK:
+                _OVERRIDES_REFRESHING.discard(key)
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def get_overrides(pid, uid):
     key = (pid, uid)
     with _OVERRIDES_CACHE_LOCK:
         ent = _OVERRIDES_CACHE.get(key)
-        if ent and time.time() < ent[0]:
-            return ent[1]
-    overrides, ts_of = _recent_verdict_overrides(pid, uid)
-    overrides = _reconcile_overrides(pid, overrides, ts_of)
+    if ent is not None and time.time() < ent[0]:
+        return ent[1]
+    if ent is None:
+        # 本进程第一次算：同步算一次，但只复核最新的一小批，绝不打出满额风暴
+        return _compute_overrides(pid, uid, limit=OVERRIDES_COLD_MAX)
+    # 过期：先用旧值（stale-while-revalidate），后台复核
+    _refresh_overrides_async(pid, uid)
+    return ent[1]
+
+
+def note_overrides(pid, uid, verdicts):
+    """把刚提交的 verdict 就地写进复核缓存，而不是把整块缓存清掉。
+
+    以前提交后 clear_overrides_cache()，下一次列表请求就要对上百张本地纠正做全量
+    /annotation 复核（16 并发占满 _UPSTREAM_SEM(8)），把并发的「下一张图 / 下一次提交」
+    堵上 2~3 秒 —— 就是「点通过偶尔要等一两秒才下一张」。
+    """
+    if not pid or not uid or not verdicts:
+        return
+    key = (pid, uid)
     with _OVERRIDES_CACHE_LOCK:
-        _OVERRIDES_CACHE[key] = (time.time() + 15, overrides)
-    return overrides
+        ent = _OVERRIDES_CACHE.get(key)
+        if ent is None:
+            return                       # 还没算过：下次算的时候自然带上（_RECENT_GROUPS 已更新）
+        overrides = ent[1]
+        for iid, v in verdicts.items():
+            if not iid:
+                continue
+            if v == "pending":
+                overrides.pop(iid, None)  # 回到「以快照 / _SAVE_PENDING」为准
+            else:
+                overrides[iid] = v
+        _OVERRIDES_CACHE[key] = (time.time() + OVERRIDES_TTL, overrides)
+
+
+def note_overrides_saved(pid, image_id):
+    """保存标注后该图在平台被重置为 pending：把该图从复核缓存里摘掉。
+
+    qc_save 拿不到质检员 uid，所以按 pid 匹配所有质检员的缓存条目。
+    """
+    if not pid or not image_id:
+        return
+    with _OVERRIDES_CACHE_LOCK:
+        for key, (exp, ov) in list(_OVERRIDES_CACHE.items()):
+            if key[0] != pid or image_id not in ov:
+                continue
+            ov.pop(image_id, None)
+            _OVERRIDES_CACHE[key] = (time.time() + OVERRIDES_TTL, ov)
 
 
 def clear_overrides_cache():
     with _OVERRIDES_CACHE_LOCK:
         _OVERRIDES_CACHE.clear()
+        _OVERRIDES_REFRESHING.clear()
 
 
 def _image_info_map(pid):
@@ -1093,6 +1178,8 @@ def qc_save(pid, image_id, boxes):
                 (g.get("verdicts") or {}).pop(image_id, None)
         # 记录「保存后应为 pending」的纠正，弥补 /images 快照滞后
         _SAVE_PENDING.setdefault(pid, set()).add(image_id)
+        # 该图在复核缓存里立刻失效（就地摘掉，不清整块，避免下一次列表请求打全量复核）
+        note_overrides_saved(pid, image_id)
         return {"ok": True, "box_count": d.get("box_count", len(boxes))}
     return {"ok": False, "error": d.get("error") or ("HTTP %s" % s)}
 
@@ -1934,6 +2021,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if sp:
                 for v in verdicts:
                     sp.discard(v.get("image_id"))
+            # 就地更新复核缓存（不清整块）：否则下一次列表请求会对上百张本地纠正
+            # 做全量 /annotation 复核，把并发的「下一张图 / 下一次提交」堵上 2~3 秒
+            failed_ids = {f.get("image_id") for f in failed}
+            note_overrides(pid, uid, {v.get("image_id"): v.get("verdict")
+                                      for v in verdicts
+                                      if v.get("image_id") and v.get("image_id") not in failed_ids})
         return self._send_json({
             "ok": True,
             "total": len(verdicts),

@@ -997,8 +997,10 @@ async function verdict(v) {
     const p = await api('/api/qc/submit', { method: 'POST', body: { pid: pid(), uid: uid(), verdicts: [{ image_id: imageId, verdict: v }] } });
     if (!p || !p.ok || p.succeeded < 1) { toast((p && p.error) || (v === 'pass' ? '通过失败' : '打回失败')); return; }
     toast(v === 'pass' ? '已通过' : '已打回');
-    refresh({ silent: true });   // 徽标与列表同源刷新（原来走单独的 loadCounts，两者会不同源）
+    // 先把查看器切到下一张（用户立刻看到反应），再后台对齐徽标与列表。
+    // 列表里已经没有这张了，重建后不会把它重新选中。
     advanceAfter(imageId);
+    refresh({ silent: true });   // 徽标与列表同源刷新（原来走单独的 loadCounts，两者会不同源）
   } finally {
     submitting = false;
   }
@@ -1015,8 +1017,8 @@ async function saveBoxes() {
     if (!r || !r.ok) { toast((r && r.error) || '保存失败'); return; }
     toast('已保存 ' + r.box_count + ' 框');
     dirty = false;
+    advanceAfter(imageId);       // 先换图（与 verdict 同理）
     refresh({ silent: true });   // 徽标与列表同源刷新
-    advanceAfter(imageId);
   } finally {
     submitting = false;
   }
