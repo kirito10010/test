@@ -65,7 +65,7 @@ const state = {
   activeCategory: null,
   currentImage: null,
   hideLabels: false,
-  shortcuts: { catKeys: {}, pass: 'c', reject: 'r', hideLabels: 'shift+3' },
+  shortcuts: { catKeys: {}, pass: 'C', reject: 'V', hideLabels: 'Shift+3' },   // 与 DEFAULT_SHORTCUTS 一致
   search: '',
   annotatorFilter: '',
   boxFilter: 'all',    // 框数筛选：all / none(无框) / some(有框) / 精确数字 / '6+'
@@ -106,7 +106,41 @@ function isLocalHost() {
 
 /* ============ 快捷键（按项目隔离，独立 localStorage） ============ */
 const QC_KEY = 'qc_keys';
-const DEFAULT_KEYS = '1234567890qwertyuiopasdfghjklzxcvbnm'.split('');
+
+/* 默认只给三个功能键：通过 C、打回 V、隐藏属性 Shift+3。
+   属性键默认留空，由使用者自己设（以前会自动分配 1/2/3…，容易被误当成"已经设好了"）。 */
+const DEFAULT_SHORTCUTS = { pass: 'C', reject: 'V', submit: 'C', hideLabels: 'Shift+3' };
+
+/* 修饰键 / 命名键的规范写法（归一化用） */
+const MOD_ALIAS = { ctrl: 'Ctrl', control: 'Ctrl', alt: 'Alt', shift: 'Shift', meta: 'Meta', cmd: 'Meta', win: 'Meta' };
+const NAMED_KEYS = { space: 'Space', delete: 'Delete', backspace: 'Backspace', enter: 'Enter', tab: 'Tab',
+                     escape: 'Escape', insert: 'Insert', home: 'Home', end: 'End', pageup: 'PageUp',
+                     pagedown: 'PageDown', arrowup: 'ArrowUp', arrowdown: 'ArrowDown',
+                     arrowleft: 'ArrowLeft', arrowright: 'ArrowRight' };
+
+/* 把任意写法（含历史遗留的 'c' / 'shift+3'）归一化成统一显示形式：
+   Ctrl+S / Shift+3 / C / 4 / Space。单个符号（¥ # 之类）直接丢弃成空。 */
+function normalizeKeyLabel(s) {
+  const raw = String(s == null ? '' : s).trim();
+  if (!raw) return '';
+  const parts = raw.split('+').map((p) => p.trim()).filter(Boolean);
+  if (!parts.length) return '';
+  const key = parts.pop();
+  const mods = [];
+  parts.forEach((p) => {
+    const m = MOD_ALIAS[p.toLowerCase()];
+    if (m && mods.indexOf(m) < 0) mods.push(m);
+  });
+  let k;
+  if (/^[a-z]$/i.test(key)) k = key.toUpperCase();                       // a -> A
+  else if (/^\d$/.test(key)) k = key;                                    // 4 -> 4
+  else if (/^numpad\d+$/i.test(key)) k = 'Numpad' + key.slice(6);         // numpad1 -> Numpad1
+  else if (NAMED_KEYS[key.toLowerCase()]) k = NAMED_KEYS[key.toLowerCase()];
+  else if (/^f\d{1,2}$/i.test(key)) k = key.toUpperCase();                // f5 -> F5
+  else if (key.length > 1) k = key.charAt(0).toUpperCase() + key.slice(1);
+  else return '';                                                        // 单个符号 → 丢弃
+  return (mods.length ? mods.join('+') + '+' : '') + k;
+}
 
 function loadShortcuts() {
   try { const raw = localStorage.getItem(QC_KEY); if (raw) return JSON.parse(raw); } catch (e) {}
@@ -119,12 +153,12 @@ function loadProjectShortcuts(pid_) {
   const all = loadShortcuts();
   const cur = (all[pid_] && all[pid_].catKeys) || {};
   const catKeys = {};
-  state.categories.forEach((c, i) => {
-    catKeys[c] = (cur[c] !== undefined && cur[c] !== null) ? cur[c] : (DEFAULT_KEYS[i] || '');
+  state.categories.forEach((c) => {
+    catKeys[c] = normalizeKeyLabel(cur[c]);   // 属性键默认留空，不再按索引分配
   });
-  const pass = (all[pid_] && all[pid_].pass) || 'c';
-  const reject = (all[pid_] && all[pid_].reject) || 'r';
-  const hideLabels = (all[pid_] && all[pid_].hideLabels) || 'shift+3';
+  const pass = normalizeKeyLabel((all[pid_] && all[pid_].pass) || DEFAULT_SHORTCUTS.pass);
+  const reject = normalizeKeyLabel((all[pid_] && all[pid_].reject) || DEFAULT_SHORTCUTS.reject);
+  const hideLabels = normalizeKeyLabel((all[pid_] && all[pid_].hideLabels) || DEFAULT_SHORTCUTS.hideLabels);
   state.shortcuts = { catKeys, pass, reject, hideLabels };
 }
 
@@ -970,19 +1004,26 @@ function updateActionButtons() {
 }
 
 /* ============ 快捷键按键处理 ============ */
+/* 一律以 e.code（物理键）为准，字母大写、数字用阿拉伯数字。
+   故意不看 e.key —— 不同键盘布局下 Shift+4 的 e.key 是 ¥、Shift+3 是 #，
+   把符号记成快捷键既看不懂也按不出来。 */
 function keyLabel(e) {
-  if (e.key === 'Escape') return null;
-  if (e.key === 'Shift' || e.key === 'Control' || e.key === 'Alt' || e.key === 'Meta') return null;
   const code = e.code || '';
-  let k;
-  if (code.startsWith('Digit')) k = code.slice(5);
-  else if (code.startsWith('Key')) k = code.slice(3).toLowerCase();
+  if (code === 'Escape' || e.key === 'Escape') return null;   // Esc 用来取消
+  if (['ShiftLeft', 'ShiftRight', 'ControlLeft', 'ControlRight', 'AltLeft', 'AltRight', 'MetaLeft', 'MetaRight'].indexOf(code) >= 0 ||
+      ['Shift', 'Control', 'Alt', 'Meta'].indexOf(e.key) >= 0) return null;   // 单独的修饰键不算
+  let k = '';
+  if (code.indexOf('Digit') === 0) k = code.slice(5);                       // Digit4 -> 4
+  else if (code.indexOf('Numpad') === 0 && code.length === 7) k = 'Numpad' + code.slice(6);
+  else if (code.indexOf('Key') === 0) k = code.slice(3).toUpperCase();      // KeyA -> A
   else if (code === 'Space') k = 'Space';
-  else k = (e.key && e.key.length === 1) ? e.key.toLowerCase() : e.key;
+  else if (code) k = code;                                                  // Delete / Enter / ArrowLeft / F5 …
+  else if (e.key && e.key.length > 1) k = e.key;                            // 兜底：只接受命名键
+  if (!k) return null;                                                      // 拿不到 code 的单字符（¥）宁可不记
   const mods = [];
-  if (e.ctrlKey) mods.push('ctrl');
-  if (e.altKey) mods.push('alt');
-  if (e.shiftKey) mods.push('shift');
+  if (e.ctrlKey) mods.push('Ctrl');
+  if (e.altKey) mods.push('Alt');
+  if (e.shiftKey) mods.push('Shift');
   return (mods.length ? mods.join('+') + '+' : '') + k;
 }
 
@@ -1001,20 +1042,20 @@ document.addEventListener('keydown', (e) => {
   if (!$('reviewerLogin').classList.contains('hidden')) return;
   const k = keyLabel(e);
   if (!k) return;
-  if (k === (state.shortcuts.pass || 'c')) {
+  if (k === (state.shortcuts.pass || DEFAULT_SHORTCUTS.pass)) {
     if (state.status === 'pending') { verdict('pass'); e.preventDefault(); }
     else if (state.status === 'passed') { advanceOnly(); e.preventDefault(); }
     else if (state.status === 'rejected') { saveBoxes(); e.preventDefault(); }
     return;
   }
-  if (k === (state.shortcuts.reject || 'r')) {
+  if (k === (state.shortcuts.reject || DEFAULT_SHORTCUTS.reject)) {
     if (state.status === 'pending' || state.status === 'recent' || state.status === 'passed') {
       verdict('reject'); e.preventDefault();
     }
     return;
   }
-  if (k === (state.shortcuts.hideLabels || 'shift+3')) { toggleHideLabels(); e.preventDefault(); return; }
-  const cat = state.categories.find((c) => (state.shortcuts.catKeys[c] || '').toLowerCase() === k);
+  if (k === (state.shortcuts.hideLabels || DEFAULT_SHORTCUTS.hideLabels)) { toggleHideLabels(); e.preventDefault(); return; }
+  const cat = state.categories.find((c) => state.shortcuts.catKeys[c] === k);
   if (cat) { setActiveCategory(cat); e.preventDefault(); }
 });
 
@@ -1035,6 +1076,8 @@ function renderSettings() {
     input.className = 'key-input';
     input.dataset.cat = c;
     input.value = state.shortcuts.catKeys[c] || '';
+    input.readOnly = true;             // 只能按出来，避免手打出 ¥ 这种脏值
+    input.placeholder = '按键设置';
     label.appendChild(input);
     body.appendChild(label);
   });
@@ -1043,7 +1086,9 @@ function renderSettings() {
   const passInput = document.createElement('input');
   passInput.className = 'key-input';
   passInput.id = 'qcPassKey';
-  passInput.value = state.shortcuts.pass || 'c';
+  passInput.value = state.shortcuts.pass || DEFAULT_SHORTCUTS.pass;
+  passInput.readOnly = true;
+  passInput.placeholder = '按键设置';
   pass.appendChild(passInput);
   body.appendChild(pass);
   const reject = document.createElement('label');
@@ -1051,7 +1096,9 @@ function renderSettings() {
   const rejectInput = document.createElement('input');
   rejectInput.className = 'key-input';
   rejectInput.id = 'qcRejectKey';
-  rejectInput.value = state.shortcuts.reject || 'r';
+  rejectInput.value = state.shortcuts.reject || DEFAULT_SHORTCUTS.reject;
+  rejectInput.readOnly = true;
+  rejectInput.placeholder = '按键设置';
   reject.appendChild(rejectInput);
   body.appendChild(reject);
   const hide = document.createElement('label');
@@ -1059,11 +1106,19 @@ function renderSettings() {
   const hideInput = document.createElement('input');
   hideInput.className = 'key-input';
   hideInput.id = 'qcHideKey';
-  hideInput.value = state.shortcuts.hideLabels || 'shift+3';
+  hideInput.value = state.shortcuts.hideLabels || DEFAULT_SHORTCUTS.hideLabels;
+  hideInput.readOnly = true;
+  hideInput.placeholder = '按键设置';
   hide.appendChild(hideInput);
   body.appendChild(hide);
   body.querySelectorAll('.key-input').forEach((el) => el.addEventListener('keydown', (e) => {
     e.preventDefault(); e.stopPropagation();
+    if (e.key === 'Escape') { el.blur(); return; }                    // Esc：不改动，退出
+    if (e.key === 'Delete' || e.key === 'Backspace') {                // Delete：删除这个快捷键
+      el.value = '';
+      el.blur();
+      return;
+    }
     const lbl = keyLabel(e);
     if (lbl) { el.value = lbl; el.blur(); }
   }));
@@ -1072,11 +1127,12 @@ function renderSettings() {
 function saveSettings() {
   const catKeys = {};
   $('settingsBody').querySelectorAll('input[data-cat]').forEach((el) => {
-    catKeys[el.dataset.cat] = el.value.trim().toLowerCase() || '';
+    catKeys[el.dataset.cat] = normalizeKeyLabel(el.value);   // 属性键允许留空
   });
-  const pass = ($('qcPassKey').value || '').trim().toLowerCase() || 'c';
-  const reject = ($('qcRejectKey').value || '').trim().toLowerCase() || 'r';
-  const hideLabels = ($('qcHideKey').value || '').trim().toLowerCase() || 'shift+3';
+  // 功能键不允许没有：清空后回落到默认值
+  const pass = normalizeKeyLabel($('qcPassKey').value) || DEFAULT_SHORTCUTS.pass;
+  const reject = normalizeKeyLabel($('qcRejectKey').value) || DEFAULT_SHORTCUTS.reject;
+  const hideLabels = normalizeKeyLabel($('qcHideKey').value) || DEFAULT_SHORTCUTS.hideLabels;
   const all = loadShortcuts();
   all[state.projectId] = { catKeys, pass, reject, hideLabels };
   saveShortcuts(all);
