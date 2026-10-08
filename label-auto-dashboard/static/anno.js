@@ -758,37 +758,45 @@ function loadImage(id) {
 }
 
 /* ============ 保存（提交） ============ */
-async function save() {
-  if (!state.currentImage) { toast('请先选择图片'); return; }
-  const imageId = state.currentImage;
-  const r = await api('/api/qc/save', { method: 'POST', body: { pid: pid(), image_id: imageId, boxes: currentBoxes } });
-  if (!r || !r.ok) { toast((r && r.error) || '保存失败'); return; }
-  toast('已保存 ' + r.box_count + ' 框');
-  // 记录最近提交（最新在前），用于「已提交」排序（持久化到浏览器，刷新后仍在最上面）
-  recordRecentSubmit(imageId);
+let submitting = false;   // 防重入：按住 C 会连发 keydown，重复提交会把下一张图的框覆盖成 0
 
-  if (state.status === 'submitted') {
-    // 已提交页签：该图保留，重新排序到顶部（refresh 会同时更新徽标与列表）
-    lastListSig = '';
-    await refresh({});
-    highlightListItem(imageId);
-  } else {
-    // 未作业/被打回：从列表移除，并自动加载下一张；徽标用同源刷新对齐
-    refresh({ silent: true });
-    let item = null;
-    Array.from($('annoList').querySelectorAll('.anno-item')).forEach((el) => {
-      if (el.dataset.id === imageId) item = el;
-    });
-    const next = item ? item.nextElementSibling : null;
-    if (item) item.remove();
-    if (next && next.dataset.id) {
-      loadImage(next.dataset.id);
+async function save() {
+  if (submitting) return;
+  if (!state.currentImage) { toast('请先选择图片'); return; }
+  submitting = true;
+  try {
+    const imageId = state.currentImage;
+    const r = await api('/api/qc/save', { method: 'POST', body: { pid: pid(), image_id: imageId, boxes: currentBoxes } });
+    if (!r || !r.ok) { toast((r && r.error) || '保存失败'); return; }
+    toast('已保存 ' + r.box_count + ' 框');
+    // 记录最近提交（最新在前），用于「已提交」排序（持久化到浏览器，刷新后仍在最上面）
+    recordRecentSubmit(imageId);
+
+    if (state.status === 'submitted') {
+      // 已提交页签：该图保留，重新排序到顶部（refresh 会同时更新徽标与列表）
+      lastListSig = '';
+      await refresh({});
+      highlightListItem(imageId);
     } else {
-      clearViewer();
-      if (!$('annoList').querySelector('.anno-item')) {
-        $('annoList').innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
+      // 未作业/被打回：从列表移除，并自动加载下一张；徽标用同源刷新对齐
+      refresh({ silent: true });
+      let item = null;
+      Array.from($('annoList').querySelectorAll('.anno-item')).forEach((el) => {
+        if (el.dataset.id === imageId) item = el;
+      });
+      const next = item ? item.nextElementSibling : null;
+      if (item) item.remove();
+      if (next && next.dataset.id) {
+        loadImage(next.dataset.id);
+      } else {
+        clearViewer();
+        if (!$('annoList').querySelector('.anno-item')) {
+          $('annoList').innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
+        }
       }
     }
+  } finally {
+    submitting = false;
   }
 }
 
@@ -891,6 +899,7 @@ document.addEventListener('keydown', (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (!$('annoSettingsBox').classList.contains('hidden')) return;
   if (!$('annoLogin').classList.contains('hidden')) return;
+  if (e.repeat) return;   // 按住不放的重复触发忽略，避免连续保存把下一张图的框覆盖成 0
   const k = keyLabel(e);
   if (!k) return;
   const submit = state.shortcuts.submit || 'c';

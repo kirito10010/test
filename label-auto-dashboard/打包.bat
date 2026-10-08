@@ -37,8 +37,13 @@ echo.
 echo Build OK. dist\ now contains:
 dir /b dist\*.exe
 echo.
-echo Reminder: for a new release, update version.json (version / notes / download_url)
+echo Release exe SHA256 -- paste this into version.json as the "sha256" field
+echo (the client refuses to self-update when sha256 is missing or mismatched):
+certutil -hashfile dist\label-auto-v2.exe SHA256
+echo.
+echo Reminder: for a new release, update version.json (version / notes / download_url / sha256)
 echo           so release builds can self-update.
+echo           Do NOT rebuild after filling in sha256, or the hash becomes stale.
 pause
 exit /b 0
 

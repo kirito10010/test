@@ -7,10 +7,12 @@ Label Auto 外接看板 —— 本地服务
 """
 import http.server
 import collections
+import hashlib
 import json
 import os
 import io
 import re
+import shutil
 import time
 import threading
 import webbrowser
@@ -40,7 +42,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.3.2"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
+VERSION = "1.3.3"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
 # 自更新检查地址：按顺序尝试，第一条成功的即用。
 # 实测 raw.githubusercontent.com 在公司内网不可达（超时），所以把 GitHub 代理放第一位：
 # 既避免每次检查白等 15s 超时，也覆盖只通代理的网络；raw 作为兜底保留（其它网络可能更快）。
@@ -53,6 +55,8 @@ UPDATE_URLS = [
 TOKEN = None
 USER = None
 _CACHE = {}   # key -> (expire_ts, data)
+_CACHE_ORDER = collections.OrderedDict()   # key -> 最近使用顺序（LRU 淘汰用）
+_CACHE_MAX = 200                           # 条数上限；超出淘汰最久未用的
 
 # 查询进度（供前端轮询显示）
 _PROGRESS = {"phase": "", "total": 0, "done": 0}
@@ -173,16 +177,37 @@ def json_bytes(obj):
 
 
 # ---------- 缓存 ----------
+def _cache_drop(key):
+    _CACHE.pop(key, None)
+    _CACHE_ORDER.pop(key, None)
+
+
+def clear_cache_all():
+    _CACHE.clear()
+    _CACHE_ORDER.clear()
+
+
 def cache_get(key, ttl=60):
-    if key in _CACHE:
-        exp, data = _CACHE[key]
-        if time.time() < exp:
-            return data
+    ent = _CACHE.get(key)
+    if ent is None:
+        _CACHE_ORDER.pop(key, None)   # 可能被 _clear_cache_keep_stable 清掉了，顺手对齐
+        return None
+    exp, data = ent
+    if time.time() < exp:
+        _CACHE_ORDER[key] = True
+        _CACHE_ORDER.move_to_end(key)
+        return data
+    _cache_drop(key)   # 过期即删，不再留着占内存（以前只返回 None，条目会一直堆着）
     return None
 
 
 def cache_set(key, data, ttl=60):
     _CACHE[key] = (time.time() + ttl, data)
+    _CACHE_ORDER[key] = True
+    _CACHE_ORDER.move_to_end(key)
+    while len(_CACHE_ORDER) > _CACHE_MAX:      # LRU：淘汰最久未用的
+        old, _ = _CACHE_ORDER.popitem(last=False)
+        _CACHE.pop(old, None)
 
 
 def _clear_cache_keep_stable():
@@ -194,7 +219,7 @@ def _clear_cache_keep_stable():
     """
     for k in list(_CACHE.keys()):
         if not k.startswith("images_") and k != "projects":
-            _CACHE.pop(k, None)
+            _cache_drop(k)
     clear_overrides_cache()   # 提交/保存后旧的 rejected 复核结果已失效，清掉立即可见
 
 
@@ -310,9 +335,8 @@ def _force_refresh(pid):
     except Exception:
         pass   # 上游异常时退回旧缓存，不阻塞页面
     clear_overrides_cache()
-    with _ANNOTATION_CACHE_LOCK:
-        for k in [k for k in _ANNOTATION_CACHE if k[0] == pid]:
-            _ANNOTATION_CACHE.pop(k, None)
+    _annotation_cache_clear_pid(pid)
+
 
 
 # 图片缓存：图片内容不可变（上游带 Cache-Control: immutable），缓存可大幅减少对上游的
@@ -622,8 +646,42 @@ def _fmt_ts(epoch):
 # annotation 状态缓存：qc_status/reviewed_at 短时间不变，缓存 30s。
 # _reconcile_overrides 会对所有本地纠正（pass/reject）逐张拉 annotation，若每次都现查，
 # 累计打回图多时会拖慢列表/计数请求（首屏与提交后卡顿的主因之一）。
-_ANNOTATION_CACHE = {}
+# 键是 (pid, image_id)：6000 图 × 多项目会很大，所以必须"过期即删 + 上限淘汰"。
+_ANNOTATION_CACHE = collections.OrderedDict()   # (pid, image_id) -> (expire_ts, value)
 _ANNOTATION_CACHE_LOCK = threading.Lock()
+_ANNOTATION_CACHE_MAX = 5000
+
+
+def _annotation_cache_get(pid, img):
+    key = (pid, img)
+    with _ANNOTATION_CACHE_LOCK:
+        ent = _ANNOTATION_CACHE.get(key)
+        if ent and time.time() < ent[0]:
+            _ANNOTATION_CACHE.move_to_end(key)
+            return ent[1]
+        if ent:
+            _ANNOTATION_CACHE.pop(key, None)   # 过期即删
+    return None
+
+
+def _annotation_cache_put(pid, img, v):
+    key = (pid, img)
+    with _ANNOTATION_CACHE_LOCK:
+        _ANNOTATION_CACHE[key] = (time.time() + 30, v)
+        _ANNOTATION_CACHE.move_to_end(key)
+        while len(_ANNOTATION_CACHE) > _ANNOTATION_CACHE_MAX:
+            _ANNOTATION_CACHE.popitem(last=False)
+
+
+def _annotation_cache_drop(pid, img):
+    with _ANNOTATION_CACHE_LOCK:
+        _ANNOTATION_CACHE.pop((pid, img), None)
+
+
+def _annotation_cache_clear_pid(pid):
+    with _ANNOTATION_CACHE_LOCK:
+        for k in [k for k in _ANNOTATION_CACHE if k[0] == pid]:
+            _ANNOTATION_CACHE.pop(k, None)
 
 
 def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
@@ -633,11 +691,9 @@ def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
     _PROGRESS["total"] = len(image_ids)
     _PROGRESS["done"] = 0
     def _one(img):
-        key = (pid, img)
-        with _ANNOTATION_CACHE_LOCK:
-            ent = _ANNOTATION_CACHE.get(key)
-            if ent and time.time() < ent[0]:
-                return img, ent[1]
+        cached = _annotation_cache_get(pid, img)
+        if cached is not None:
+            return img, cached
         s, h, raw = upstream("GET", "/api/projects/%s/annotation" % pid,
                              query={"image_id": img}, token=_get_owner_token())
         try:
@@ -646,8 +702,7 @@ def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
                  "reviewed_at": d.get("reviewed_at") or ""}
         except Exception:
             v = {"qc_status": "", "reviewed_at": ""}
-        with _ANNOTATION_CACHE_LOCK:
-            _ANNOTATION_CACHE[key] = (time.time() + 30, v)
+        _annotation_cache_put(pid, img, v)
         return img, v
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         for img, v in ex.map(_one, image_ids):
@@ -1356,6 +1411,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self._send_json({"ok": False, "need_login": True,
                                 "error": "该质检员需要登录后才能查看数据"}, 401)
 
+    def _write_gate(self):
+        """写接口门槛。
+
+        发布版必须先登录（与读接口口径一致）；开发版保持原样 —— 开发版的"你是谁"完全由
+        客户端自报（X-User-Id / 请求体里的 uid），而 _get_qc_token(uid) 会用内置凭据自动
+        登录该 uid，所以给开发版写接口加门槛没有实际意义（自报一个内置 uid 就能过）。
+        真正的修法是"服务端记住 token 属于哪个 uid"，属于下一批的请求级鉴权。
+        """
+        if not RELEASE_MODE:
+            return None
+        return self._qc_gated(_current_uid())
+
     # ---- 路由 ----
     def do_GET(self):
         self._route("GET")
@@ -1388,7 +1455,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/logout" and method == "POST":
             TOKEN = None
             USER = None
-            _CACHE.clear()
+            clear_cache_all()
             return self._send_json({"ok": True})
 
         if path == "/api/me" and method == "GET":
@@ -1414,8 +1481,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not RELEASE_MODE and path == "/api/query_progress" and method == "GET":
             return self._send_json({"ok": True, "progress": _PROGRESS})
 
-        # ---- 自动登录（于荣华，看板与质检平台共用） ----
-        if path in ("/api/qc/autologin", "/api/autologin") and method == "GET":
+        # ---- 自动登录（于荣华，看板与质检平台共用；仅开发版） ----
+        # 发布版禁用：否则局域网任何人 GET 一次就能把全局身份改成 owner（也等于一个登录 CSRF 入口）。
+        # 发布版的前端本来就不调它（qc.js/anno.js 都是 RELEASE 分支走登录页）。
+        if not RELEASE_MODE and path in ("/api/qc/autologin", "/api/autologin") and method == "GET":
             s, h, raw = upstream("POST", "/api/login",
                                  body={"email": QC_EMAIL, "password": QC_PASSWORD})
             if s == 200:
@@ -1567,14 +1636,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         m = re.match(r"^/api/qc/submit$", path)
         if m and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
             return self._handle_qc_submit()
 
         m = re.match(r"^/api/qc/fix$", path)
         if m and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
             return self._handle_qc_fix()
 
         m = re.match(r"^/api/qc/save$", path)
         if m and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
             raw = self._read_body()
             try:
                 body = json.loads(raw.decode("utf-8"))
@@ -1663,6 +1741,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # /api/projects/{id}/batch_qc  (POST)
             m = re.match(r"^/api/projects/([^/]+)/batch_qc$", path)
             if m and method == "POST":
+                gate = self._write_gate()
+                if gate:
+                    return gate
                 return self._handle_batch_qc(m.group(1))
 
         return self._send_json({"ok": False, "error": "未知接口: " + path}, 404)
@@ -1809,9 +1890,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 failed.append({"image_id": iid, "error": d.get("error") or ("HTTP %s" % s)})
         _clear_cache_keep_stable()
         # 提交会改变这些图的 qc_status，清掉 annotation 缓存，避免 _reconcile_overrides 读到旧的 pending
-        with _ANNOTATION_CACHE_LOCK:
-            for v in verdicts:
-                _ANNOTATION_CACHE.pop((pid, v.get("image_id")), None)
+        for v in verdicts:
+            _annotation_cache_drop(pid, v.get("image_id"))
         # 本地记录最近提交（最新在前）。verdict 用于纠正 /images 状态滞后，
         # 保留足够多组（100 组≈400 张），避免提交较多后早期纠正丢失、已通过图
         # 又因快照滞后被当成 pending；「最近提交」页仍只取前 12 张。
@@ -1912,9 +1992,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             path = "/qc.html"
         elif path == "/anno":
             path = "/anno.html"
+        elif RELEASE_MODE and path == "/index.html":
+            # 发布版没有数据看板（见文件头注释），直接挡掉，别让人从 URL 摸进来
+            return self._send_json({"ok": False, "error": "发布版不提供数据看板"}, 404)
         rel = path[len("/static/"):] if path.startswith("/static/") else path.lstrip("/")
         fp = os.path.normpath(os.path.join(STATIC_DIR, rel))
-        if not fp.startswith(STATIC_DIR) or not os.path.isfile(fp):
+        # 边界用 commonpath 判，比 startswith 严：startswith 会放行 staticX/ 这种"同前缀"目录
+        try:
+            inside = os.path.commonpath([fp, STATIC_DIR]) == STATIC_DIR
+        except ValueError:
+            inside = False   # 不同盘符等异常情况一律拒绝
+        if not inside or not os.path.isfile(fp):
             return self._send_json({"ok": False, "error": "文件不存在"}, 404)
         ext = os.path.splitext(fp)[1].lower().lstrip(".")
         ctype = {"html": "text/html; charset=utf-8", "js": "application/javascript; charset=utf-8",
@@ -1975,6 +2063,15 @@ def _version_tuple(v):
     return tuple(int(x) for x in parts) or (0,)
 
 
+def _sha256_file(path):
+    """分块算 SHA-256，返回小写 hex（大文件不整块读进内存）"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _check_update():
     for url in UPDATE_URLS:
         try:
@@ -1984,11 +2081,18 @@ def _check_update():
             continue        # 这条不通（超时/被挡/返回非 JSON）就试下一条
         new_ver = d.get("version") or ""
         if _version_tuple(new_ver) > _version_tuple(VERSION):
-            _prompt_update(new_ver, d.get("notes") or "", d.get("download_url") or "")
+            sha = (d.get("sha256") or "").strip().lower()
+            if len(sha) != 64:
+                # 校验值是这套机制的前提，缺了就不更新（fail-closed），并提示管理员去补
+                _msgbox("更新信息不完整",
+                        "新版本 %s 的更新信息里没有 sha256 校验值，已跳过本次更新。\n\n"
+                        "请管理员在 version.json 里补上 sha256 后重新发布。" % new_ver, 0x30)  # MB_ICONWARNING
+            else:
+                _prompt_update(new_ver, d.get("notes") or "", d.get("download_url") or "", sha)
         return              # 已拿到版本信息（无论要不要更新），不再试其它地址
 
 
-def _prompt_update(version, notes, url):
+def _prompt_update(version, notes, url, sha):
     if not url:
         return
     try:
@@ -1998,7 +2102,7 @@ def _prompt_update(version, notes, url):
         MB_ICONQUESTION = 0x20
         r = ctypes.windll.user32.MessageBoxW(0, msg, "标注平台更新", MB_YESNO | MB_ICONQUESTION)
         if r == 6:  # IDYES
-            _do_update(url)
+            _do_update(url, sha)
     except Exception:
         pass
 
@@ -2033,7 +2137,11 @@ def _download_with_progress(url, new_path):
                     f.write(chunk)
                     done += len(chunk)
                     q.put(("progress", done, total))
-            q.put(("done", True, None))
+            # 只有明确下满了才算成功：以前这里无条件报成功，断网截断的半个文件也会去覆盖旧 exe
+            if total and done != total:
+                q.put(("done", False, "下载不完整（%d/%d 字节）" % (done, total)))
+            else:
+                q.put(("done", True, None))
         except Exception as e:
             q.put(("done", False, e))
 
@@ -2080,7 +2188,7 @@ def _download_with_progress(url, new_path):
     return final["ok"], final["error"]
 
 
-def _do_update(url):
+def _do_update(url, expect_sha):
     try:
         exe_path = sys.executable
         new_path = exe_path + ".new"
@@ -2088,6 +2196,22 @@ def _do_update(url):
         if not ok:
             _msgbox("更新失败", "下载新版本失败：\n%s" % err, 0x10)  # MB_ICONERROR
             return
+        # 校验下载到的文件，不通过就删掉半成品、绝不替换
+        got = _sha256_file(new_path)
+        if got.lower() != (expect_sha or "").lower():
+            try:
+                os.remove(new_path)
+            except Exception:
+                pass
+            _msgbox("更新失败",
+                    "下载到的文件校验不通过，已放弃本次更新（旧版本未受影响）。\n\n"
+                    "期望 %s…\n实际 %s…" % (str(expect_sha)[:12], got[:12]), 0x10)
+            return
+        # 替换前把当前 exe 备份成 .old：新版本万一启动不了，旁边的 .old 就是上一版可用文件
+        try:
+            shutil.copy2(exe_path, exe_path + ".old")
+        except Exception:
+            pass
         # 写「安装完成」标记，新版本启动时据此提示
         try:
             with open(exe_path + ".updated", "w", encoding="utf-8") as f:
@@ -2122,7 +2246,10 @@ def _update_loop():
 
 
 def _maybe_show_updated_notice():
-    """更新完成后的首次启动：提示「安装完成」，并清理标记文件。"""
+    """更新完成后的首次启动：提示「安装完成」，并清理标记文件与 .old 备份。
+
+    能执行到这里就说明新版本已经正常启动，所以上一版的 .old 备份不再需要。
+    """
     try:
         flag = sys.executable + ".updated"
         if os.path.exists(flag):
@@ -2131,6 +2258,12 @@ def _maybe_show_updated_notice():
             except Exception:
                 pass
             _msgbox("更新完成", "已更新到版本 %s" % VERSION, 0x40)  # MB_ICONINFORMATION
+            old = sys.executable + ".old"
+            if os.path.exists(old):
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
     except Exception:
         pass
 
