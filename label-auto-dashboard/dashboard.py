@@ -1464,6 +1464,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if path == "/api/config" and method == "GET":
             return self._send_json({"ok": True, "release": RELEASE_MODE})
 
+        # ---- 版本 / 更新（照片区右下角的版本号 + 更新按钮用） ----
+        # 只回版本号，无敏感信息，所以和 /api/config 一样不加门槛。
+        if path == "/api/update" and method == "GET":
+            info = update_status()
+            return self._send_json({"ok": True, "version": VERSION,
+                                    "latest": info["latest"],
+                                    "has_update": info["has_update"],
+                                    "can_update": RELEASE_MODE})
+
+        if path == "/api/update/apply" and method == "POST":
+            gate = self._write_gate()
+            if gate:
+                return gate
+            if not RELEASE_MODE:
+                # 管理员版的 download_url 指向员工版，替换会把管理员版变成员工版，直接拒绝
+                return self._send_json({"ok": False,
+                                        "error": "管理员版请手动替换 exe，不支持在线更新"}, 400)
+            info = update_status()
+            if not info["has_update"] or not info["url"] or len(info["sha256"]) != 64:
+                return self._send_json({"ok": False, "error": "当前已是最新版本"}, 400)
+            # 先回响应，再在后台真正更新（_do_update 要下载 + 替换 + 重启，不能让请求线程等）
+            threading.Timer(1.0, lambda: _do_update(info["url"], info["sha256"])).start()
+            return self._send_json({"ok": True, "message": "正在下载更新，完成后程序会自动重启"})
+
         if path == "/api/projects" and method == "GET":
             # 走缓存 + 探针强拉：看板下拉与各平台共用同一份项目列表，
             # 避免前端每次轮询都去拉重的 /api/projects
@@ -2072,24 +2096,73 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
-def _check_update():
+# 更新信息缓存：页面查询（GET /api/update）与后台轮询共用，避免每次都去拉代理。
+UPDATE_CHECK_TTL = 600      # 秒
+
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_INFO = {"ts": 0.0, "latest": "", "url": "", "sha256": "", "notes": "",
+                "has_update": False, "refreshing": False}
+
+
+def _fetch_update_info():
+    """按顺序试 UPDATE_URLS，返回 {latest,url,sha256,notes,has_update}；全部不通返回 None。"""
     for url in UPDATE_URLS:
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "label-auto-updater"})
             d = json.loads(urllib.request.urlopen(req, timeout=15).read().decode("utf-8"))
         except Exception:
             continue        # 这条不通（超时/被挡/返回非 JSON）就试下一条
-        new_ver = d.get("version") or ""
-        if _version_tuple(new_ver) > _version_tuple(VERSION):
-            sha = (d.get("sha256") or "").strip().lower()
-            if len(sha) != 64:
-                # 校验值是这套机制的前提，缺了就不更新（fail-closed），并提示管理员去补
-                _msgbox("更新信息不完整",
-                        "新版本 %s 的更新信息里没有 sha256 校验值，已跳过本次更新。\n\n"
-                        "请管理员在 version.json 里补上 sha256 后重新发布。" % new_ver, 0x30)  # MB_ICONWARNING
-            else:
-                _prompt_update(new_ver, d.get("notes") or "", d.get("download_url") or "", sha)
-        return              # 已拿到版本信息（无论要不要更新），不再试其它地址
+        latest = d.get("version") or ""
+        return {"latest": latest,
+                "url": d.get("download_url") or "",
+                "sha256": (d.get("sha256") or "").strip().lower(),
+                "notes": d.get("notes") or "",
+                "has_update": _version_tuple(latest) > _version_tuple(VERSION)}
+    return None
+
+
+def _refresh_update_info():
+    """拉一次并写进缓存；拉不到也记时间戳（避免每个请求都去重试）。"""
+    info = _fetch_update_info()
+    with _UPDATE_LOCK:
+        if info is not None:
+            _UPDATE_INFO.update({"latest": info["latest"], "url": info["url"],
+                                 "sha256": info["sha256"], "notes": info["notes"],
+                                 "has_update": info["has_update"]})
+        _UPDATE_INFO["ts"] = time.time()
+        _UPDATE_INFO["refreshing"] = False
+    return info
+
+
+def update_status():
+    """给页面用的更新状态。
+
+    缓存过期时**先返回旧值**，同时在后台线程里刷新 —— 不能让页面等 15s 的上游超时。
+    """
+    with _UPDATE_LOCK:
+        info = dict(_UPDATE_INFO)
+    if time.time() - info["ts"] > UPDATE_CHECK_TTL and not info["refreshing"]:
+        with _UPDATE_LOCK:
+            _UPDATE_INFO["refreshing"] = True
+        threading.Thread(target=_refresh_update_info, daemon=True).start()
+    return info
+
+
+def _check_update():
+    """后台轮询（每 10 分钟）用：刷新缓存，有新版本就弹原来的原生提示。
+
+    页面右下角另有常驻的「版本号 + 更新按钮」，这里保留弹窗做双保险。
+    """
+    info = _refresh_update_info()
+    if not info or not info["has_update"]:
+        return
+    if len(info["sha256"]) != 64:
+        # 校验值是这套机制的前提，缺了就不更新（fail-closed），并提示管理员去补
+        _msgbox("更新信息不完整",
+                "新版本 %s 的更新信息里没有 sha256 校验值，已跳过本次更新。\n\n"
+                "请管理员在 version.json 里补上 sha256 后重新发布。" % info["latest"], 0x30)  # MB_ICONWARNING
+        return
+    _prompt_update(info["latest"], info["notes"], info["url"], info["sha256"])
 
 
 def _prompt_update(version, notes, url, sha):
