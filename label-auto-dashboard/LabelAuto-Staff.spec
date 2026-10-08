@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='label-auto-v2',
+    name='LabelAuto-Staff',
     icon='eternal-night-studio.ico',
     debug=False,
     bootloader_ignore_signals=False,
