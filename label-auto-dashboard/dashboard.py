@@ -121,12 +121,20 @@ def _current_uid():
 # ======================================================================
 # 限制对上游的并发请求数，避免多人同时使用时把原平台拖慢
 _UPSTREAM_SEM = threading.Semaphore(8)
+# 批量拉取（逐张 annotation 这类扇出）单独再限一道：最多占 _UPSTREAM_SEM 的一半，
+# 保证交互请求（图片转发 / 提交 / 列表）永远有槽可用。
+# 策略只在这里表达一次——调用方只需在批量扇出时传 bulk=True，不必各自记得降并发。
+BULK_UPSTREAM_MAX = 4
+_BULK_SEM = threading.Semaphore(BULK_UPSTREAM_MAX)
 
 
-def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=None, token=None, _retry=True):
+def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=None, token=None,
+             _retry=True, bulk=False):
     """把请求转发到 Label Auto，自动附带 Bearer token。返回 (status, headers, bytes)
 
     token 参数可指定用某个用户的 token（如质检员本人），缺省用全局 owner TOKEN。
+    bulk=True 表示「这是批量扇出里的一次」（逐张拉 annotation），会额外抢 _BULK_SEM：
+    最多占掉一半全局并发槽，剩下的一半留给交互请求，避免批量把「下一张图 / 下一次提交」堵住。
     """
     global _OWNER_TOKEN
     url = BASE + path
@@ -143,16 +151,26 @@ def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=N
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         headers.setdefault("Content-Type", "application/json")
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with _UPSTREAM_SEM:
-        try:
-            resp = urllib.request.urlopen(req, timeout=180)
-            status, h, raw = resp.status, dict(resp.headers), resp.read()
-        except urllib.error.HTTPError as e:
-            status, h, raw = e.code, dict(e.headers), e.read()
-        except Exception as e:
-            return 502, {}, json.dumps(
-                {"ok": False, "error": "无法连接平台 %s：%s" % (BASE, e)},
-                ensure_ascii=False).encode("utf-8")
+    # 锁顺序固定：批量先 _BULK_SEM 再 _UPSTREAM_SEM，交互只取 _UPSTREAM_SEM。
+    # 交互不碰 _BULK_SEM，所以不存在环、不会死锁。
+    if bulk:
+        _BULK_SEM.acquire()
+    try:
+        with _UPSTREAM_SEM:
+            try:
+                resp = urllib.request.urlopen(req, timeout=180)
+                status, h, raw = resp.status, dict(resp.headers), resp.read()
+            except urllib.error.HTTPError as e:
+                status, h, raw = e.code, dict(e.headers), e.read()
+            except Exception as e:
+                return 502, {}, json.dumps(
+                    {"ok": False, "error": "无法连接平台 %s：%s" % (BASE, e)},
+                    ensure_ascii=False).encode("utf-8")
+    finally:
+        # 必须在 401 自愈重试之前释放：递归重试会再抢一次 _BULK_SEM，
+        # 而 Semaphore 不可重入，外层还握着就会自己死锁。
+        if bulk:
+            _BULK_SEM.release()
     # token 过期自愈：清掉缓存凭据并重新登录，再重试一次，避免整站持续 401（只能重启服务）
     if status == 401 and tok and _retry:
         new_tok = None
@@ -168,7 +186,7 @@ def upstream(method, path, query=None, body=None, raw_body=None, extra_headers=N
                 new_tok = _get_qc_token(uids[0])
         if new_tok and new_tok != tok:
             return upstream(method, path, query=query, body=body, raw_body=raw_body,
-                            extra_headers=extra_headers, token=new_tok, _retry=False)
+                            extra_headers=extra_headers, token=new_tok, _retry=False, bulk=bulk)
     return status, h, raw
 
 
@@ -688,7 +706,11 @@ def _annotation_cache_clear_pid(pid):
 
 
 def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
-    """并发拉取每张图的 qc_status + reviewed_at（带 30s 短缓存）"""
+    """并发拉取每张图的 qc_status + reviewed_at（带 30s 短缓存）
+
+    这是**批量扇出**：上游请求一律带 bulk=True，最多占一半全局并发槽
+    （见 upstream 的 bulk 参数），把另一半留给交互请求。
+    """
     data = {}
     _PROGRESS["phase"] = "annotation"
     _PROGRESS["total"] = len(image_ids)
@@ -698,7 +720,8 @@ def fetch_annotations(pid, image_ids, max_workers=SORT_CONCURRENCY):
         if cached is not None:
             return img, cached
         s, h, raw = upstream("GET", "/api/projects/%s/annotation" % pid,
-                             query={"image_id": img}, token=_get_owner_token())
+                             query={"image_id": img}, token=_get_owner_token(),
+                             bulk=True)
         try:
             d = json.loads(raw.decode("utf-8"))
             v = {"qc_status": d.get("qc_status") or "",
@@ -744,7 +767,7 @@ def _reconcile_overrides(pid, overrides, ts_of, limit=None):
         return overrides
     if limit is not None and len(ids) > limit:
         ids = ids[:limit]
-    fresh = fetch_annotations(pid, ids, max_workers=RECONCILE_WORKERS)
+    fresh = fetch_annotations(pid, ids)
     for k in ids:
         st = (fresh.get(k) or {}).get("qc_status") or ""
         if st == "pending":
@@ -763,7 +786,8 @@ def _reconcile_overrides(pid, overrides, ts_of, limit=None):
 # （stale-while-revalidate，与 get_images 同一套写法）。
 OVERRIDES_TTL = 15          # 复核结果缓存（沿用原 15s）
 OVERRIDES_COLD_MAX = 12     # 冷启动时同步复核的上限：12 张 ≈ 0.3s，不阻塞
-RECONCILE_WORKERS = 4       # 复核并发上限：只占 _UPSTREAM_SEM(8) 的一半，留一半给交互请求
+# 复核的并发上限不在这里控制：它走 fetch_annotations → upstream(bulk=True)，
+# 由 _BULK_SEM(4) 统一限制（见文件顶部「批量让路」的说明）。
 
 _OVERRIDES_CACHE = {}          # (pid, uid) -> (expire_ts, overrides)
 _OVERRIDES_CACHE_LOCK = threading.Lock()
