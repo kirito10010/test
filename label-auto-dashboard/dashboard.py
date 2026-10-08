@@ -40,7 +40,7 @@ else:
 #   dev     → 开发版（三合一：看板 + 质检 + 作业，内置账号，可切换质检员/作业员/平台）
 #   release → 发布版（登录自己账号，无看板，不能切换，内置管理员仅用于改属性权限）
 RELEASE_MODE = os.environ.get("LABEL_AUTO_RELEASE") == "1"
-VERSION = "1.3.1"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
+VERSION = "1.3.2"   # 发布版自更新用：当前版本号（同时用于静态资源指纹）
 # 自更新检查地址：按顺序尝试，第一条成功的即用。
 # 实测 raw.githubusercontent.com 在公司内网不可达（超时），所以把 GitHub 代理放第一位：
 # 既避免每次检查白等 15s 超时，也覆盖只通代理的网络；raw 作为兜底保留（其它网络可能更快）。
@@ -518,14 +518,20 @@ def get_projects_for_ui():
 
 
 def _filter_projects_payload(data):
-    """把 projects 响应按活跃白名单过滤 + 按创建时间倒序（就地改传入的 dict 并返回）"""
+    """把 projects 响应按活跃白名单过滤 + 按创建时间倒序，返回**新的 dict**。
+
+    注意不能就地改传入的 dict：传进来的就是 projects 缓存本体，就地过滤会把缓存
+    永久裁掉一批项目（之后 get_project() 就再也找不到它们了）。
+    """
     if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
         return data
+    out = dict(data)
+    projects = data["projects"]
     active = _active_project_ids()
     if active is not None:
-        data["projects"] = [p for p in data["projects"] if p.get("id") in active]
-    data["projects"] = _sort_projects_desc(data["projects"])   # 新项目排最前
-    return data
+        projects = [p for p in projects if p.get("id") in active]
+    out["projects"] = _sort_projects_desc(projects)   # 新项目排最前
+    return out
 
 
 def get_users():
@@ -933,11 +939,15 @@ def _is_force(qs):
     return (qs.get("force", [""])[0] or "").lower() in ("1", "true", "yes")
 
 
-def _qc_status_resolver(pid, uid, force=False):
-    """返回 (files, resolve, box_map)。
+def _qc_status_resolver(pid, uid, force=False, _retry=True):
+    """返回 (files, resolve, box_map, snapshot_missing)。
 
     counts 与 items 必须复用同一次调用的结果：/images 是 stale-while-revalidate 快照，
     若两者各拉一次，后台刷新恰好落在这两次请求之间就会让计数与列表永久不一致。
+
+    snapshot_missing = 该质检员名下有分配、但 /images 快照里完全没有的图数。
+    快照缺图时 resolve() 返回 None，被 _qc_counts_of 记成「作业中」，三个页签却一张都不显示
+    （就是「小圈有数字、列表空、中间纯黑」）。这里先自救一次，再把这个数量报给前端解释。
     """
     if force:
         _force_refresh(pid)
@@ -952,6 +962,14 @@ def _qc_status_resolver(pid, uid, force=False):
         if iid:
             status_map[iid] = im.get("qc_status")
             box_map[iid] = im.get("box_count") or 0
+    # 名下有图、快照却一张都没有 → 快照明显不完整（新建项目/刚加图时常见），
+    # 同步强拉一次再判；只重试 1 次，避免把上游拖慢
+    if files and not status_map and _retry:
+        try:
+            _fetch_images_sync(pid, force=True)
+        except Exception:
+            pass
+        return _qc_status_resolver(pid, uid, force=False, _retry=False)
     overrides = get_overrides(pid, uid)
     save_pending = _SAVE_PENDING.get(pid) or set()
 
@@ -963,7 +981,8 @@ def _qc_status_resolver(pid, uid, force=False):
             return "pending"
         return status_map.get(f)
 
-    return files, resolve, box_map
+    snapshot_missing = sum(1 for f in files if f not in status_map)
+    return files, resolve, box_map, snapshot_missing
 
 
 def _qc_counts_of(files, resolve):
@@ -982,9 +1001,9 @@ def _qc_counts_of(files, resolve):
 
 
 def qc_counts(pid, uid, force=False):
-    """返回某质检员的实时数量：总数 / 作业中 / 待质检 / 已通过 / 已打回"""
-    files, resolve, _ = _qc_status_resolver(pid, uid, force)
-    return _qc_counts_of(files, resolve)
+    """返回 (counts, snapshot_missing)：总数 / 作业中 / 待质检 / 已通过 / 已打回"""
+    files, resolve, _, snapshot_missing = _qc_status_resolver(pid, uid, force)
+    return _qc_counts_of(files, resolve), snapshot_missing
 
 
 def qc_recent(pid, uid, force=False):
@@ -993,10 +1012,11 @@ def qc_recent(pid, uid, force=False):
     for g in _RECENT_GROUPS:
         if g.get("pid") == pid and g.get("uid") == uid:
             out.extend(g.get("image_ids") or [])
-    files, resolve, box_map = _qc_status_resolver(pid, uid, force)
+    files, resolve, box_map, snapshot_missing = _qc_status_resolver(pid, uid, force)
     items = out[:12]
     box_counts = {f: box_map.get(f, 0) for f in items}
-    return {"items": items, "box_counts": box_counts, "counts": _qc_counts_of(files, resolve)}
+    return {"items": items, "box_counts": box_counts,
+            "counts": _qc_counts_of(files, resolve), "snapshot_missing": snapshot_missing}
 
 
 def qc_save(pid, image_id, boxes):
@@ -1026,8 +1046,10 @@ def qc_assigned(pid, uid, status, offset, limit, cat_names=None, force=False):
     """返回某质检员在指定 qc_status 下的图片列表（分页）；cat_names 非空时按属性过滤。
 
     同时返回 counts（与 items 同一快照、同一过滤范围），供前端一次请求同时渲染徽标与列表。
+    snapshot_missing：名下有分配、但 /images 快照里完全没有的图数 —— 快照缺图时前端据此
+    解释「小圈有数字、列表空」，而不是干瞪着纯黑。
     """
-    files, resolve, box_map = _qc_status_resolver(pid, uid, force)
+    files, resolve, box_map, snapshot_missing = _qc_status_resolver(pid, uid, force)
     cat_bases = category_match_bases(pid, cat_names) if cat_names else None
     if cat_bases is not None:
         files = [f for f in files if _base_name(f) in cat_bases]
@@ -1036,7 +1058,8 @@ def qc_assigned(pid, uid, status, offset, limit, cat_names=None, force=False):
     total = len(matched)
     items = matched[offset:offset + limit]
     box_counts = {f: box_map.get(f, 0) for f in items}
-    return {"total": total, "items": items, "box_counts": box_counts, "counts": counts}
+    return {"total": total, "items": items, "box_counts": box_counts,
+            "counts": counts, "snapshot_missing": snapshot_missing}
 
 
 def anno_setup():
@@ -1263,14 +1286,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                    json_bytes(obj))
 
     def _serve_image(self, pid, query):
-        """带内存缓存的图片转发：命中缓存直接返回，未命中拉取上游并缓存，减少对上游的重复请求。"""
+        """带内存缓存的图片转发：命中缓存直接返回，未命中拉取上游并缓存，减少对上游的重复请求。
+
+        只把「真正的图片」（200 + Content-Type: image/* + body 非空）发给浏览器；
+        上游的错误（502/404 的 JSON）一律原样状态码 + no-store，绝不冒充 image/jpeg。
+        响应头不再发 immutable/max-age：图片内容虽然不可变，但一旦某次拿到坏响应，
+        immutable 会让浏览器一小时内不再重试 —— F5 和重新登录都救不回来，
+        只能去开发者工具里清站点数据（实测就是这么被坑的）。
+        """
         image_id = query.get("image_id", "")
         if image_id:
             cached = _image_cache_get(pid, image_id)
             if cached:
                 ct, body = cached
-                return self._send(200, {"Content-Type": ct,
-                                        "Cache-Control": "public, max-age=3600, immutable"}, body)
+                return self._send(200, {"Content-Type": ct, "Cache-Control": "no-store"}, body)
         key = pid + "/" + image_id
         with _IMAGE_INFLIGHT_LOCK:
             evt = _IMAGE_INFLIGHT.get(key)
@@ -1285,17 +1314,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cached = _image_cache_get(pid, image_id)
             if cached:
                 ct, body = cached
-                return self._send(200, {"Content-Type": ct,
-                                        "Cache-Control": "public, max-age=3600, immutable"}, body)
+                return self._send(200, {"Content-Type": ct, "Cache-Control": "no-store"}, body)
         try:
             s, h, raw = upstream("GET", "/api/projects/%s/image" % pid, query=query)
-            ct = h.get("Content-Type") or "image/jpeg"
-            if s == 200 and image_id:
-                _image_cache_put(pid, image_id, ct, raw)
-            headers = {"Content-Type": ct}
-            if h.get("Cache-Control"):
-                headers["Cache-Control"] = h["Cache-Control"]
-            return self._send(s, headers, raw)
+            ct = h.get("Content-Type") or ""
+            if s == 200 and ct.startswith("image/") and raw:
+                if image_id:
+                    _image_cache_put(pid, image_id, ct, raw)
+                return self._send(200, {"Content-Type": ct, "Cache-Control": "no-store"}, raw)
+            # 不是真图片：原样状态码，不缓存、不冒充 image/*
+            return self._send(s or 502,
+                              {"Content-Type": ct or "application/octet-stream",
+                               "Cache-Control": "no-store"}, raw)
         finally:
             if is_owner:
                 with _IMAGE_INFLIGHT_LOCK:
@@ -1517,7 +1547,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if gate:
                 return gate
             try:
-                return self._send_json({"ok": True, "counts": qc_counts(pid, uid, force=_is_force(qs))})
+                counts, snapshot_missing = qc_counts(pid, uid, force=_is_force(qs))
+                return self._send_json({"ok": True, "counts": counts,
+                                        "snapshot_missing": snapshot_missing})
             except RuntimeError as e:
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 

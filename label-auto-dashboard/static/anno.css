@@ -112,6 +112,17 @@ body {
 .anno-item.active { background: #e6effc; border-color: #2b6de8; }
 
 .empty { padding: 40px; text-align: center; color: #999; }
+/* 没有图可显示时，别再留一块纯黑让人以为「一直在加载」 */
+.viewer .empty {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 6px; padding: 24px;
+  background: #23272e; color: #b8bec7;
+}
+/* 空列表的「为什么空」说明 + 可点的操作 */
+.empty-sub { margin-top: 6px; font-size: 12px; line-height: 1.6; color: #8a919b; }
+.empty-action { margin-top: 10px; }
+.empty-action .btn { margin: 0 4px; }
 
 /* 图片查看器（缩放平移 + 框叠加） */
 .viewer { position: relative; width: 100%; height: 100%; overflow: hidden; cursor: crosshair; background: #000; }

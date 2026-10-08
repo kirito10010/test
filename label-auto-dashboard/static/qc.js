@@ -81,6 +81,7 @@ const boxCache = {};   // imageId -> boxes，用于预加载标注框，避免�
 let imageToken = 0;    // 换图自增，丢弃过期的异步标注框结果，避免串图
 let listEls = [];      // 右侧列表 DOM 项缓存，避免每次通过/换图都全量 querySelectorAll 扫描
 let lastListSig = '';  // 上次列表签名，内容没变就只刷新徽标、不重建 DOM（10s 轮询用）
+let pendingRebuild = null;  // 因 listBusy() 跳过的列表重建（含所属 pid/uid，避免串项目）
 
 function pid() { return state.projectId; }
 function uid() { return state.reviewerUid; }
@@ -264,6 +265,8 @@ function onProjectChange() {
   state.activeCategory = null;
   loadProjectShortcuts(state.projectId);
   renderCategoryButtons();
+  clearCounts();        // 别让上一个项目的数字留在新项目上（否则就是「小圈有数字 + 列表空」）
+  pendingRebuild = null;
   resetFilters();   // 切项目必须清掉旧搜索/作业员/属性筛选，否则新列表会被旧条件过滤成空
   renderReviewerSelect(p ? p.reviewers : []);
   savePrefs();
@@ -306,6 +309,8 @@ function onReviewerChange() {
   clearViewer();
   savePrefs();
   loadDailyStats();
+  clearCounts();        // 同上：换质检员后徽标必须清空，等新数据回来再填
+  pendingRebuild = null;
   resetFilters();
   loadAnnotatorOwners();
 
@@ -539,7 +544,6 @@ function applyFilters(items, boxCounts) {
 
 /* ============ 右侧列表 + 徽标计数（同一次请求，保证一致） ============ */
 let listToken = 0;    // 切页签/项目/刷新时自增，丢弃过期的异步结果，避免竞态
-let countsToken = 0;  // 单独的计数请求（登录探针、提交后）也需要令牌保护
 
 function listUrl(force) {
   const q = ['pid=' + encodeURIComponent(pid()), 'uid=' + encodeURIComponent(uid())];
@@ -555,9 +559,15 @@ function listUrl(force) {
   return base + '?' + q.join('&');
 }
 
-function renderCounts(c) {
+/* 徽标只由 refresh() 在「列表已定」之后调用。
+   以前 loadCounts() 会单独请求 /api/qc/counts 并直接写徽标，于是徽标与列表可能来自
+   两次不同的快照 —— 那正是「小圈有数字、列表空」的来源，这条路已经拆掉。 */
+function renderCounts(c, snapshotMissing, shownCount) {
   if (!c) return;
-  $('qcCounts').textContent = '共 ' + c.total + ' 条：作业中 ' + c.annotating;
+  let line = '共 ' + c.total + ' 条：作业中 ' + c.annotating;
+  if (filtersActive() && typeof shownCount === 'number') line += '（筛选后 ' + shownCount + '）';
+  if (snapshotMissing > 0) line += '；其中 ' + snapshotMissing + ' 张图片数据未就绪';
+  $('qcCounts').textContent = line;
   $('badgePending').textContent = c.pending;
   $('badgePassed').textContent = c.passed;
   $('badgeRejected').textContent = c.rejected;
@@ -570,10 +580,17 @@ function clearCounts() {
   $('badgeRejected').textContent = '';
 }
 
+/* 是否有前端筛选在生效（决定要不要在徽标后面标「筛选后 M」） */
+function filtersActive() {
+  return !!(state.search.trim() || state.annotatorFilter || state.catFilter.length ||
+            (state.boxFilter && state.boxFilter !== 'all'));
+}
+
 function showListError(msg) {
   listEls = [];
   lastActiveId = null;
-  $('qcList').innerHTML = '<div class="empty">' + esc(msg || '加载失败') + '</div>';
+  $('qcList').innerHTML = '<div class="empty"><div>' + esc(msg || '加载失败') + '</div>' +
+    '<div class="empty-action"><button class="btn" data-empty-action="retry">重试</button></div></div>';
 }
 
 /* 列表内容签名：状态/筛选/每项及其框数都没变 → 只刷徽标，不重建 DOM */
@@ -582,28 +599,53 @@ function listSignature(items, boxCounts) {
           items.map((id) => id + ':' + (boxCounts[id] || 0)).join(',')].join('|');
 }
 
-function rebuildList(items, boxCounts) {
+function rebuildList(items, boxCounts, rawCount, snapshotMissing, counts) {
   const listEl = $('qcList');
   listEl.innerHTML = '';
   listEls = [];
   lastActiveId = null;
   if (!items.length) {
-    listEl.innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
+    listEl.innerHTML = emptyStateHtml({ counts, rawCount, snapshotMissing });
     return;
   }
   items.forEach((id) => makeListItem(id, (state.annOf[id] || {}).name, boxCounts[id]));
 }
 
-/* 正在改框 / 提交中 / 有弹窗：自动刷新不要打断用户 */
-function uiBusy() {
-  return dirty || submitting ||
-    !$('settings').classList.contains('hidden') ||
-    !$('reviewerLogin').classList.contains('hidden');
+/* 空列表必须说清「为什么空」：以前只有一句「暂无未质检图」+ 中间一块纯黑，
+   用户只能理解成「坏了 / 一直在加载」。这里把四种原因分开写，并给出可点的操作。 */
+function emptyStateHtml(ctx) {
+  const c = (ctx && ctx.counts) || {};
+  const rawCount = (ctx && ctx.rawCount) || 0;
+  const snapshotMissing = (ctx && ctx.snapshotMissing) || 0;
+  const lines = [];
+  const acts = [];
+  if (rawCount > 0) {
+    lines.push('服务端返回 ' + rawCount + ' 张，当前筛选后 0 张。');
+    acts.push(['clear-filter', '清空筛选']);
+  } else if (filtersActive()) {
+    lines.push('当前有筛选条件，在筛选范围内没有命中。');
+    acts.push(['clear-filter', '清空筛选']);
+  }
+  if (snapshotMissing > 0) {
+    lines.push('该项目有 ' + snapshotMissing + ' 张图还没出现在平台的图片列表里（已自动重试过一次）。');
+    acts.push(['retry', '重试']);
+  }
+  if (!lines.length && (c.annotating || 0) > 0) {
+    lines.push('该质检员名下的图还没作业完成（作业中 ' + c.annotating + ' 张），暂时没有可质检的图。');
+  }
+  return '<div class="empty"><div>' + esc(statusEmptyText()) + '</div>' +
+    lines.map((t) => '<div class="empty-sub">' + esc(t) + '</div>').join('') +
+    (acts.length
+      ? '<div class="empty-action">' + acts.map(([a, label]) =>
+          '<button class="btn" data-empty-action="' + a + '">' + esc(label) + '</button>').join('') + '</div>'
+      : '') +
+    '</div>';
 }
 
 async function refresh(opts) {
   opts = opts || {};
   if (!pid() || !uid()) return [];
+  flushPendingRebuild();   // 上次因 listBusy() 跳过的重建，现在不忙了就补上
   const myToken = ++listToken;
   if (!opts.silent && !$('qcList').children.length) {
     $('qcList').innerHTML = '<div class="empty">加载中…</div>';
@@ -612,30 +654,47 @@ async function refresh(opts) {
   try {
     r = await api(listUrl(opts.force));
   } catch (e) {
-    if (myToken === listToken && !opts.silent) showListError('网络异常，请点「刷新」重试');
+    if (myToken === listToken && !opts.silent) {
+      clearCounts();   // 失败时不留上一个项目的数字（否则就是「小圈有数字 + 列表空」）
+      showListError('网络异常，请点「刷新」重试');
+    }
     return [];
   }
   if (myToken !== listToken) return [];   // 期间又切了页签/项目，丢弃过期结果
   if (!r || !r.ok) {
-    if (!opts.silent) showListError((r && r.error) || '加载失败');
+    if (!opts.silent) {
+      clearCounts();
+      showListError((r && r.error) || '加载失败');
+    }
     return [];
   }
-  renderCounts(r.counts);   // 与列表同源，不会再出现「有计数、没数据」
 
   const boxCounts = r.box_counts || {};
   const rawItems = r.items || [];
   const items = applyFilters(rawItems, boxCounts);
+  const snapshotMissing = r.snapshot_missing || 0;
   const sig = listSignature(items, boxCounts);
+
+  // 签名没变 → DOM 里就是这份 items，可以安全地把徽标对齐过来
   if (sig === lastListSig) {
+    renderCounts(r.counts, snapshotMissing, items.length);
     if (opts.autoSelect && !state.currentImage && items.length) loadImage(items[0]);
     return items;
   }
-  if (opts.silent && uiBusy()) return items;   // 只更徽标，列表等用户空闲再重建
+  // 正在提交/弹窗开着：不重建列表，但也**不更新徽标**（徽标必须与列表同源），
+  // 把结果挂起来等空闲后补上。以前这里只更徽标不更列表，会留下
+  // 「小圈有数字、列表空」并且再也不恢复的状态。
+  if (listBusy()) {
+    pendingRebuild = { pid: pid(), uid: uid(), items, boxCounts, sig,
+                       counts: r.counts, rawCount: rawItems.length, snapshotMissing };
+    return items;
+  }
 
   const prevScroll = $('qcList').scrollTop;
-  rebuildList(items, boxCounts);
+  rebuildList(items, boxCounts, rawItems.length, snapshotMissing, r.counts);
   lastListSig = sig;
   $('qcList').scrollTop = prevScroll;   // 保留滚动位置，避免自动刷新把用户弹回顶部
+  renderCounts(r.counts, snapshotMissing, items.length);
 
   // 当前图真的从后端列表里消失了（被别人通过/打回）才自动换图；
   // 只是被搜索/筛选隐藏时不打扰用户
@@ -652,19 +711,29 @@ async function refresh(opts) {
   return items;
 }
 
-/* 单独的计数请求：登录探针与提交后使用（列表请求本身已带 counts） */
-async function loadCounts() {
-  if (!pid() || !uid()) return;
-  const myToken = ++countsToken;
-  let r;
-  try {
-    r = await api('/api/qc/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
-  } catch (e) {
+/* 列表重建要避开的只有「正在提交」和「弹窗开着」。
+   质检员只是改过框（dirty）时重建列表是无害的（不动查看器和 currentBoxes）；
+   以前把 dirty 也算进去，会出现：列表空 → 点不到图 → dirty 永远清不掉 → 列表永远不重建。 */
+function listBusy() {
+  return submitting ||
+    !$('settings').classList.contains('hidden') ||
+    !$('reviewerLogin').classList.contains('hidden');
+}
+
+/* 把因 listBusy() 挂起的重建补上（只补同一个项目/质检员的，避免串项目） */
+function flushPendingRebuild() {
+  if (!pendingRebuild || listBusy()) return;
+  if (pendingRebuild.pid !== pid() || pendingRebuild.uid !== uid()) {
+    pendingRebuild = null;
     return;
   }
-  if (myToken !== countsToken) return;   // 已切项目/质检员，丢弃过期结果
-  if (!r || !r.ok) return;
-  renderCounts(r.counts);
+  const pr = pendingRebuild;
+  pendingRebuild = null;
+  const prevScroll = $('qcList').scrollTop;
+  rebuildList(pr.items, pr.boxCounts, pr.rawCount, pr.snapshotMissing, pr.counts);
+  lastListSig = pr.sig;
+  $('qcList').scrollTop = prevScroll;
+  renderCounts(pr.counts, pr.snapshotMissing, pr.items.length);
 }
 
 function switchStatus(status) {
@@ -758,7 +827,7 @@ function clearViewer() {
   imageToken++;   // 使在途的标注框加载失效
   const v = $('qcViewer');
   if (currentViewer) { currentViewer.destroy(); currentViewer = null; }
-  v.innerHTML = '<div class="empty">请选择图片</div>';
+  v.innerHTML = '<div class="empty">左侧列表暂无可显示的图</div>';
   currentBoxes = [];
   state.currentImage = null;
   dirty = false;
@@ -835,11 +904,12 @@ async function verdict(v) {
     const p = await api('/api/qc/submit', { method: 'POST', body: { pid: pid(), uid: uid(), verdicts: [{ image_id: imageId, verdict: v }] } });
     if (!p || !p.ok || p.succeeded < 1) { toast((p && p.error) || (v === 'pass' ? '通过失败' : '打回失败')); return; }
     toast(v === 'pass' ? '已通过' : '已打回');
-    loadCounts();
+    refresh({ silent: true });   // 徽标与列表同源刷新（原来走单独的 loadCounts，两者会不同源）
     advanceAfter(imageId);
   } finally {
     submitting = false;
   }
+  flushPendingRebuild();   // 提交结束、不忙了 → 立刻把刚才挂起的重建补上
 }
 
 async function saveBoxes() {
@@ -852,11 +922,12 @@ async function saveBoxes() {
     if (!r || !r.ok) { toast((r && r.error) || '保存失败'); return; }
     toast('已保存 ' + r.box_count + ' 框');
     dirty = false;
-    loadCounts();
+    refresh({ silent: true });   // 徽标与列表同源刷新
     advanceAfter(imageId);
   } finally {
     submitting = false;
   }
+  flushPendingRebuild();
 }
 
 function advanceAfter(id) {
@@ -1042,6 +1113,14 @@ $('qcSearch').addEventListener('input', () => { state.search = $('qcSearch').val
 $('qcAnnotatorFilter').onchange = () => { state.annotatorFilter = $('qcAnnotatorFilter').value; refresh({}); };
 $('qcBoxFilter').onchange = () => { state.boxFilter = $('qcBoxFilter').value; refresh({}); };
 $('qcRefresh').onclick = onManualRefresh;
+// 空列表里的「清空筛选 / 重试」按钮（列表内容是动态重建的，所以用事件委托）
+$('qcList').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-empty-action]');
+  if (!b) return;
+  const act = b.dataset.emptyAction;
+  if (act === 'clear-filter') { resetFilters(); refresh({ force: true }); }
+  else if (act === 'retry') { onManualRefresh(); }
+});
 $('qcCatPickerField').addEventListener('click', (e) => { e.stopPropagation(); toggleCatPicker(); });
 document.addEventListener('click', (e) => {
   if (!$('qcCatPicker').contains(e.target)) $('qcCatPickerDropdown').classList.add('hidden');

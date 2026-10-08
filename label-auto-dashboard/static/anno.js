@@ -343,6 +343,7 @@ function onProjectChange() {
   state.recentSubmits = loadProjectRecent(state.projectId);
   loadProjectShortcuts(state.projectId);
   renderCategoryButtons();
+  clearCounts();        // 别让上一个项目的数字留在新项目上（否则就是「小圈有数字 + 列表空」）
   resetFilters();   // 切项目必须清掉旧搜索/质检员筛选，否则新列表会被旧条件过滤成空
   renderAnnotatorSelect(p ? p.annotators : []);
   savePrefs();
@@ -383,6 +384,7 @@ function onAnnotatorChange() {
   clearViewer();
   savePrefs();
   loadDailyStats();
+  clearCounts();        // 同上：换作业员后徽标必须清空，等新数据回来再填
   resetFilters();
   loadQcOwners();
   if (!RELEASE) {
@@ -478,7 +480,6 @@ function setActiveCategory(cat) {
 
 /* ============ 右侧列表 + 徽标计数（同一次请求，保证一致） ============ */
 let listToken = 0;    // 切页签/项目/刷新时自增，丢弃过期的异步结果，避免竞态
-let countsToken = 0;  // 单独的计数请求（登录探针、保存后）也需要令牌保护
 
 function listUrl(force) {
   const q = ['pid=' + encodeURIComponent(pid()), 'uid=' + encodeURIComponent(uid()),
@@ -497,9 +498,13 @@ function orderItems(items) {
   return recent.concat(rest);
 }
 
-function renderCounts(c) {
+/* 徽标只由 refresh() 在「列表已定」之后调用（原来 loadCounts 会单独请求计数并直接写徽标，
+   徽标与列表可能来自两次不同的快照）。 */
+function renderCounts(c, shownCount) {
   if (!c) return;
-  $('annoCounts').textContent = '共 ' + c.total + ' 条：已提交 ' + c.submitted;
+  let line = '共 ' + c.total + ' 条：已提交 ' + c.submitted;
+  if (filtersActive() && typeof shownCount === 'number') line += '（筛选后 ' + shownCount + '）';
+  $('annoCounts').textContent = line;
   $('badgeUnannotated').textContent = c.unannotated;
   $('badgeSubmitted').textContent = c.submitted;
   $('badgeRejected').textContent = c.rejected;
@@ -512,9 +517,16 @@ function clearCounts() {
   $('badgeRejected').textContent = '';
 }
 
+/* 是否有前端筛选在生效（决定要不要在徽标后面标「筛选后 M」） */
+function filtersActive() {
+  return !!(state.search.trim() || state.qcFilter ||
+            (state.boxFilter && state.boxFilter !== 'all'));
+}
+
 function showListError(msg) {
   lastListSig = '';
-  $('annoList').innerHTML = '<div class="empty">' + esc(msg || '加载失败') + '</div>';
+  $('annoList').innerHTML = '<div class="empty"><div>' + esc(msg || '加载失败') + '</div>' +
+    '<div class="empty-action"><button class="btn" data-empty-action="retry">重试</button></div></div>';
 }
 
 /* 列表内容签名：状态/筛选/每项及其框数都没变 → 只刷徽标，不重建 DOM */
@@ -524,16 +536,37 @@ function listSignature(items, boxCounts) {
           items.map((id) => id + ':' + (boxCounts[id] || 0)).join(',')].join('|');
 }
 
-function rebuildList(items, boxCounts) {
+function rebuildList(items, boxCounts, rawCount) {
   const listEl = $('annoList');
   listEl.innerHTML = '';
   if (!items.length) {
-    listEl.innerHTML = '<div class="empty">' + statusEmptyText() + '</div>';
+    listEl.innerHTML = emptyStateHtml({ rawCount });
     return;
   }
   items.forEach((id) => makeListItem(id, (state.qcOf[id] || {}).name, boxCounts[id]));
   // 预加载前几张图片，减少切换时闪黑
   items.slice(0, 4).forEach((id) => prefetchImage(id));
+}
+
+/* 空列表必须说清「为什么空」：只有一句「暂无未作业图」的话，分不清是真没有还是被筛选藏了 */
+function emptyStateHtml(ctx) {
+  const rawCount = (ctx && ctx.rawCount) || 0;
+  const lines = [];
+  const acts = [];
+  if (rawCount > 0) {
+    lines.push('服务端返回 ' + rawCount + ' 张，当前筛选后 0 张。');
+    acts.push(['clear-filter', '清空筛选']);
+  } else if (filtersActive()) {
+    lines.push('当前有筛选条件，在筛选范围内没有命中。');
+    acts.push(['clear-filter', '清空筛选']);
+  }
+  return '<div class="empty"><div>' + esc(statusEmptyText()) + '</div>' +
+    lines.map((t) => '<div class="empty-sub">' + esc(t) + '</div>').join('') +
+    (acts.length
+      ? '<div class="empty-action">' + acts.map(([a, label]) =>
+          '<button class="btn" data-empty-action="' + a + '">' + esc(label) + '</button>').join('') + '</div>'
+      : '') +
+    '</div>';
 }
 
 /* 有弹窗时自动刷新不要打断用户 */
@@ -553,29 +586,39 @@ async function refresh(opts) {
   try {
     r = await api(listUrl(opts.force));
   } catch (e) {
-    if (myToken === listToken && !opts.silent) showListError('网络异常，请点「刷新」重试');
+    if (myToken === listToken && !opts.silent) {
+      clearCounts();   // 失败时不留上一个项目的数字（否则就是「小圈有数字 + 列表空」）
+      showListError('网络异常，请点「刷新」重试');
+    }
     return [];
   }
   if (myToken !== listToken) return [];   // 期间又切了页签/项目，丢弃过期结果
   if (!r || !r.ok) {
-    if (!opts.silent) showListError((r && r.error) || '加载失败');
+    if (!opts.silent) {
+      clearCounts();
+      showListError((r && r.error) || '加载失败');
+    }
     return [];
   }
-  renderCounts(r.counts);   // 与列表同源，不会再出现「有计数、没数据」
 
   const boxCounts = r.box_counts || {};
-  const items = orderItems(applyFilters(r.items || [], boxCounts));
+  const rawItems = r.items || [];
+  const items = orderItems(applyFilters(rawItems, boxCounts));
   const sig = listSignature(items, boxCounts);
+  // 签名没变 → DOM 里就是这份 items，可以安全地把徽标对齐过来
   if (sig === lastListSig) {
+    renderCounts(r.counts, items.length);
     if (opts.autoSelect && !state.currentImage && items.length) loadImage(items[0]);
     return items;
   }
-  if (opts.silent && uiBusy()) return items;   // 只更徽标，列表等用户空闲再重建
+  // 弹窗开着：不重建列表，也**不更新徽标**（徽标必须与列表同源）
+  if (opts.silent && uiBusy()) return items;
 
   const prevScroll = $('annoList').scrollTop;
-  rebuildList(items, boxCounts);
+  rebuildList(items, boxCounts, rawItems.length);
   lastListSig = sig;
   $('annoList').scrollTop = prevScroll;   // 保留滚动位置
+  renderCounts(r.counts, items.length);
 
   if (opts.autoSelect) {
     if (items.length) loadImage(items[0]);
@@ -585,21 +628,6 @@ async function refresh(opts) {
   }
   // 自动刷新不动当前图，避免丢掉正在画的框
   return items;
-}
-
-/* 单独的计数请求：登录探针与保存后使用（列表请求本身已带 counts） */
-async function loadCounts() {
-  if (!pid() || !uid()) return;
-  const myToken = ++countsToken;
-  let r;
-  try {
-    r = await api('/api/anno/counts?pid=' + encodeURIComponent(pid()) + '&uid=' + encodeURIComponent(uid()));
-  } catch (e) {
-    return;
-  }
-  if (myToken !== countsToken) return;   // 已切项目/作业员，丢弃过期结果
-  if (!r || !r.ok) return;
-  renderCounts(r.counts);
 }
 
 function switchStatus(status) {
@@ -628,7 +656,7 @@ function statusEmptyText() {
   return '暂无被打回图';
 }
 
-/* ============ 数量统计（见上方 loadCounts：单独请求，列表请求自带 counts） ============ */
+/* ============ 数量统计（徽标由 refresh() 与列表同源渲染） ============ */
 
 function makeListItem(id, qcName, boxCount) {
   const item = document.createElement('div');
@@ -684,7 +712,7 @@ function clearViewer() {
   imageToken++;   // 使在途的标注框加载失效
   const v = $('annoViewer');
   if (currentViewer) { currentViewer.destroy(); currentViewer = null; }
-  v.innerHTML = '<div class="empty">请选择图片</div>';
+  v.innerHTML = '<div class="empty">左侧列表暂无可显示的图</div>';
   currentBoxes = [];
   state.currentImage = null;
 }
@@ -738,15 +766,15 @@ async function save() {
   toast('已保存 ' + r.box_count + ' 框');
   // 记录最近提交（最新在前），用于「已提交」排序（持久化到浏览器，刷新后仍在最上面）
   recordRecentSubmit(imageId);
-  loadCounts();
 
   if (state.status === 'submitted') {
-    // 已提交页签：该图保留，重新排序到顶部
+    // 已提交页签：该图保留，重新排序到顶部（refresh 会同时更新徽标与列表）
     lastListSig = '';
     await refresh({});
     highlightListItem(imageId);
   } else {
-    // 未作业/被打回：从列表移除，并自动加载下一张
+    // 未作业/被打回：从列表移除，并自动加载下一张；徽标用同源刷新对齐
+    refresh({ silent: true });
     let item = null;
     Array.from($('annoList').querySelectorAll('.anno-item')).forEach((el) => {
       if (el.dataset.id === imageId) item = el;
@@ -889,6 +917,14 @@ $('annoSearch').addEventListener('input', () => { state.search = $('annoSearch')
 $('annoQcFilter').onchange = () => { state.qcFilter = $('annoQcFilter').value; refresh({}); };
 $('annoBoxFilter').onchange = () => { state.boxFilter = $('annoBoxFilter').value; refresh({}); };
 $('annoRefresh').onclick = onManualRefresh;
+// 空列表里的「清空筛选 / 重试」按钮（列表内容是动态重建的，所以用事件委托）
+$('annoList').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-empty-action]');
+  if (!b) return;
+  const act = b.dataset.emptyAction;
+  if (act === 'clear-filter') { resetFilters(); refresh({ force: true }); }
+  else if (act === 'retry') { onManualRefresh(); }
+});
 $('annoSettings').onclick = openSettings;
 $('annoSettingsClose').onclick = closeSettings;
 $('annoSettingsSave').onclick = saveSettings;
