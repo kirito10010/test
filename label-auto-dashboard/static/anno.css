@@ -18,11 +18,25 @@ body {
 }
 .anno-spacer { flex: 1; }
 .anno-counts { font-size: 12px; color: #888; }
-.anno-daily-stats { font-size: 12px; color: #555; display: inline-flex; align-items: center; gap: 6px; }
-.anno-daily-stats .ds-title { font-weight: 600; }
-.anno-daily-stats .ds-item { display: inline-flex; align-items: baseline; gap: 3px; }
-.anno-daily-stats .ds-day { color: #999; }
-.anno-daily-stats .ds-num { font-weight: 600; }
+/* 标注量：平时是一个紧凑模块（标题 + 今天数量），鼠标悬浮才展开每日明细 */
+.anno-daily-stats { position: relative; flex: none; }
+.anno-daily-stats .ds-module {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 8px; border: 1px solid #ccd2d9; border-radius: 6px;
+  background: #fff; font-size: 12px; color: #555; white-space: nowrap; cursor: default;
+}
+.anno-daily-stats .ds-module .ds-title { color: #888; }
+.anno-daily-stats .ds-module .ds-num { font-weight: 600; color: #333; }
+.anno-daily-stats .ds-pop {
+  display: none; position: absolute; top: 100%; right: 0; z-index: 60; margin-top: 4px;
+  padding: 8px 10px; background: #fff; border: 1px solid #ccd2d9; border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.12); font-size: 12px; white-space: nowrap;
+}
+.anno-daily-stats .ds-module:hover .ds-pop { display: block; }
+.anno-daily-stats .ds-row { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.anno-daily-stats .ds-row + .ds-row { margin-top: 3px; }
+.anno-daily-stats .ds-row .ds-day { color: #999; }
+.anno-daily-stats .ds-row .ds-num { font-weight: 600; color: #333; }
 
 .btn {
   padding: 8px 20px; border: 1px solid #ccd2d9; border-radius: 6px;
@@ -55,21 +69,53 @@ body {
 .anno-hint { font-size: 12px; color: #888; }
 .anno-actions { display: flex; flex-direction: column; gap: 8px; margin-top: auto; }
 
-.anno-main { flex: 1; min-width: 0; display: flex; background: #000; border-radius: 6px; overflow: hidden; }
+.anno-main { flex: 1; min-width: 0; display: flex; position: relative; background: #000; border-radius: 6px; overflow: hidden; }
+
+/* 照片区右下角：当前版本 + 更新按钮。
+   pointer-events: none 是关键 —— 卡片压在照片上，不能挡住这个角落的画框/右键平移；
+   只有按钮自己恢复 auto 可点。 */
+.anno-version {
+  position: absolute; right: 10px; bottom: 10px; z-index: 30;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
+  padding: 6px 8px; border-radius: 8px;
+  background: rgba(0,0,0,0.45); color: #e6e8ea; font-size: 12px;
+  pointer-events: none;
+}
+.anno-version:empty { display: none; }
+.anno-version .ver-now { font-weight: 600; }
+.anno-version .ver-hint { color: #ffd479; }
+.anno-version .ver-btn {
+  pointer-events: auto;
+  padding: 2px 8px; font-size: 12px; line-height: 18px;
+  color: #fff; background: #2b6de8; border: 1px solid #2b6de8; border-radius: 4px; cursor: pointer;
+}
+.anno-version .ver-btn:disabled { background: #6b7280; border-color: #6b7280; cursor: not-allowed; }
 
 .anno-list-panel {
   flex: none; width: 280px; display: flex; flex-direction: column; gap: 8px;
   background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; padding: 10px; min-height: 0;
 }
 .anno-list-tabs { display: flex; gap: 6px; }
-.anno-filters { display: flex; gap: 6px; }
-.anno-filters input {
-  flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #ccd2d9;
-  border-radius: 6px; font-size: 13px;
+/* 两列网格：搜索框占一整行，两个下拉各占半行。
+   以前用 flex，两个 select 的固有宽度（取最长选项）会把搜索框挤到几乎看不见。
+   注意必须用 > 子选择器：.anno-filters input 以后若加了属性下拉，会把里面的 checkbox 一起匹配。 */
+.anno-filters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
 }
-.anno-filters select {
-  max-width: 130px; padding: 6px 6px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 12px;
+.anno-filters > input,
+.anno-filters > .label-picker { grid-column: 1 / -1; }
+.anno-filters > input,
+.anno-filters > select { width: 100%; min-width: 0; box-sizing: border-box; }
+.anno-filters > input {
+  padding: 6px 8px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 13px;
 }
+.anno-filters > select {
+  padding: 6px 6px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 12px;
+}
+/* 作业平台暂时没有「按属性筛选」，这条是为将来补上时与质检平台保持同一套定位 */
+.anno-filters .label-picker { position: relative; }
 .anno-qc-tag { font-size: 11px; color: #888; margin-top: 3px; }
 .anno-item-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
 .anno-item-name {

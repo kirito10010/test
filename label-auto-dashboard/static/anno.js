@@ -251,11 +251,67 @@ function loadDailyStats() {
 
 function formatDailyStats(title, days) {
   if (!days || !days.length) return '';
-  const today = days[0].date;
-  return '<span class="ds-title">' + title + '</span>' + days.map((d) => {
+  const today = days[0].date;   // 后端按日期倒序返回，[0] 就是今天
+  // 平时只显示一个紧凑模块（标题 + 今天的数量），鼠标悬浮才展开每日明细（纯 CSS :hover）
+  const rows = days.map((d) => {
     const label = d.date === today ? '今天' : d.date.slice(5);
-    return '<span class="ds-item"><span class="ds-day">' + label + '</span><span class="ds-num">' + d.count + '</span></span>';
+    return '<div class="ds-row"><span class="ds-day">' + label + '</span>' +
+           '<span class="ds-num">' + d.count + '</span></div>';
   }).join('');
+  return '<div class="ds-module">' +
+    '<span class="ds-title">' + title + '</span>' +
+    '<span class="ds-num">' + (days[0].count || 0) + '</span>' +
+    '<div class="ds-pop">' + rows + '</div>' +
+    '</div>';
+}
+
+/* ============ 版本号 / 更新 ============ */
+const VER_POLL_MS = 600000;   // 10 分钟；服务端还有 600s 缓存
+let verTimer = null;
+
+async function loadVersion() {
+  let r;
+  try {
+    r = await api('/api/update');
+  } catch (e) {
+    return;   // 拉不到就保持现状，不打扰用户
+  }
+  if (!r || !r.ok) return;
+  const box = $('annoVersion');
+  if (!box) return;
+  const can = !!r.can_update;     // 管理员版不支持在线更新（会把管理员版换成员工版）
+  const has = !!r.has_update;
+  const hint = has ? '<div class="ver-hint">有新版本 ' + esc(r.latest || '') + '</div>' : '';
+  const btnText = has ? (can ? '更新' : '请手动替换') : (can ? '已是最新' : '管理员版');
+  const disabled = !has || !can;
+  box.innerHTML = '<div class="ver-now">v' + esc(r.version || '?') + '</div>' + hint +
+    '<button class="ver-btn" id="annoUpdateBtn"' + (disabled ? ' disabled' : '') + '>' + esc(btnText) + '</button>';
+  const b = $('annoUpdateBtn');
+  if (b && !disabled) b.onclick = applyUpdate;
+}
+
+async function applyUpdate() {
+  const b = $('annoUpdateBtn');
+  if (b) { b.disabled = true; b.textContent = '更新中…'; }
+  let r;
+  try {
+    r = await api('/api/update/apply', { method: 'POST' });
+  } catch (e) {
+    toast('更新失败（网络异常）');
+    loadVersion();
+    return;
+  }
+  if (!r || !r.ok) {
+    toast((r && r.error) || '更新失败');
+    loadVersion();
+    return;
+  }
+  toast(r.message || '正在下载更新，程序会自动重启');
+}
+
+function startVersionAuto() {
+  if (verTimer) return;
+  verTimer = setInterval(loadVersion, VER_POLL_MS);
 }
 
 /* ============ 搜索 / 质检员筛选 / 归属显示 ============ */
@@ -341,6 +397,8 @@ async function init() {
   state.setupIds = state.setup.map((p) => p.id).join(',');
   renderProjectSelect();
   startPoll();
+  loadVersion();
+  startVersionAuto();
 }
 
 function applyReleaseUI() {
