@@ -127,10 +127,11 @@ body {
 .qc-item {
   padding: 10px 12px; border: 1px solid #e3e6ea; border-radius: 8px; font-size: 13px;
   line-height: 1.5; cursor: pointer; min-height: 42px; flex-shrink: 0;
-  /* 列表量大时（上千条）只渲染可视区，避免每次通过/切图都重排整列导致卡顿 */
-  content-visibility: auto;
-  contain-intrinsic-size: auto 54px;
 }
+/* 注意：不要给 .qc-item 加 content-visibility / contain-intrinsic-size。
+   那会让离屏项只按"估算高度"占位，而项的真实高度有两种（有/无「标注：某某」那行），
+   于是列表总高度是估算值、拖动时又随渲染不断变化 → 滚动条"拖到哪不是哪"、thumb 还会变短。
+   作业平台的 .anno-item 从来没有这两个属性，所以它是准的。 */
 .qc-item:hover { background: #f4f5f7; }
 .qc-item.active { background: #e6effc; border-color: #2b6de8; }
 .qc-ann-tag { font-size: 11px; color: #888; margin-top: 3px; }
