@@ -26,11 +26,25 @@ body {
   min-width: 160px; font-size: 13px;
 }
 .qc-counts { font-size: 12px; color: #888; }
-.qc-daily-stats { font-size: 12px; color: #555; display: inline-flex; align-items: center; gap: 6px; }
-.qc-daily-stats .ds-title { font-weight: 600; }
-.qc-daily-stats .ds-item { display: inline-flex; align-items: baseline; gap: 3px; }
-.qc-daily-stats .ds-day { color: #999; }
-.qc-daily-stats .ds-num { font-weight: 600; }
+/* 质检量：平时是一个紧凑模块（标题 + 今天数量），鼠标悬浮才展开每日明细 */
+.qc-daily-stats { position: relative; flex: none; }
+.qc-daily-stats .ds-module {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 4px 8px; border: 1px solid #ccd2d9; border-radius: 6px;
+  background: #fff; font-size: 12px; color: #555; white-space: nowrap; cursor: default;
+}
+.qc-daily-stats .ds-module .ds-title { color: #888; }
+.qc-daily-stats .ds-module .ds-num { font-weight: 600; color: #333; }
+.qc-daily-stats .ds-pop {
+  display: none; position: absolute; top: 100%; right: 0; z-index: 60; margin-top: 4px;
+  padding: 8px 10px; background: #fff; border: 1px solid #ccd2d9; border-radius: 6px;
+  box-shadow: 0 4px 14px rgba(0,0,0,0.12); font-size: 12px; white-space: nowrap;
+}
+.qc-daily-stats .ds-module:hover .ds-pop { display: block; }
+.qc-daily-stats .ds-row { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; }
+.qc-daily-stats .ds-row + .ds-row { margin-top: 3px; }
+.qc-daily-stats .ds-row .ds-day { color: #999; }
+.qc-daily-stats .ds-row .ds-num { font-weight: 600; color: #333; }
 .qc-spacer { flex: 1; }
 
 .btn {
@@ -75,15 +89,26 @@ body {
   background: #fff; border: 1px solid #e3e6ea; border-radius: 6px; padding: 10px; min-height: 0;
 }
 .qc-list-tabs { display: flex; gap: 6px; }
-.qc-filters { display: flex; flex-wrap: wrap; gap: 6px; }
-.qc-filters input {
-  flex: 1; min-width: 0; padding: 6px 8px; border: 1px solid #ccd2d9;
-  border-radius: 6px; font-size: 13px;
+/* 两列网格：搜索框与属性筛选各占一整行，两个下拉各占半行。
+   以前用 flex + wrap，两个 select 的固有宽度（取最长选项）会把 flex:1 的搜索框挤到几乎看不见。
+   注意必须用 > 子选择器：.qc-filters input 会把属性下拉里的 checkbox 一起匹配，
+   width:100% 会把复选框拉满整行。 */
+.qc-filters {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
 }
-.qc-filters select {
-  max-width: 130px; padding: 6px 6px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 12px;
+.qc-filters > input,
+.qc-filters > .label-picker { grid-column: 1 / -1; }
+.qc-filters > input,
+.qc-filters > select { width: 100%; min-width: 0; box-sizing: border-box; }
+.qc-filters > input {
+  padding: 6px 8px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 13px;
 }
-.qc-filters .label-picker { position: relative; flex: 1 1 100%; min-width: 0; }
+.qc-filters > select {
+  padding: 6px 6px; border: 1px solid #ccd2d9; border-radius: 6px; font-size: 12px;
+}
+.qc-filters .label-picker { position: relative; }
 .label-picker-field {
   border: 1px solid #ccd2d9; border-radius: 6px; padding: 5px 8px; cursor: pointer;
   min-height: 16px; background: #fff; display: flex; flex-wrap: wrap; align-items: center; gap: 2px; font-size: 12px;

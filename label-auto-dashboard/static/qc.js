@@ -237,11 +237,18 @@ function loadDailyStats() {
 }
 function formatDailyStats(title, days) {
   if (!days || !days.length) return '';
-  const today = days[0].date;
-  return '<span class="ds-title">' + title + '</span>' + days.map((d) => {
+  const today = days[0].date;   // 后端按日期倒序返回，[0] 就是今天
+  // 平时只显示一个紧凑模块（标题 + 今天的数量），鼠标悬浮才展开每日明细（纯 CSS :hover）
+  const rows = days.map((d) => {
     const label = d.date === today ? '今天' : d.date.slice(5);
-    return '<span class="ds-item"><span class="ds-day">' + label + '</span><span class="ds-num">' + d.count + '</span></span>';
+    return '<div class="ds-row"><span class="ds-day">' + label + '</span>' +
+           '<span class="ds-num">' + d.count + '</span></div>';
   }).join('');
+  return '<div class="ds-module">' +
+    '<span class="ds-title">' + title + '</span>' +
+    '<span class="ds-num">' + (days[0].count || 0) + '</span>' +
+    '<div class="ds-pop">' + rows + '</div>' +
+    '</div>';
 }
 
 /* ============ 初始化 ============ */
